@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "lldbAiHelper": {
+      "command": "<PROJECT_PATH>/venv/bin/python",
+      "args": [
+        "<PROJECT_PATH>/lldbAiHelper_MCP.py"
+      ],
+      "env": {}
+    }
+  }
+}

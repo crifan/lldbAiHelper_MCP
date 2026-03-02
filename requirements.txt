@@ -1,0 +1,4 @@
+# lldbAiHelper MCP Server 依赖
+
+# MCP Python SDK (带 CLI 工具)
+mcp[cli]>=1.0.0
