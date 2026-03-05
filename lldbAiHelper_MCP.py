@@ -17,11 +17,39 @@ import sys
 import os
 import json
 import socket
+import logging
+from datetime import datetime
 from typing import Dict, Any
 
+# ============== 日志配置 - 按日期子目录存放 ==============
+_now = datetime.now()
+_date_str = _now.strftime('%Y%m%d')
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", _date_str)
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"mcp_server_{_now.strftime('%Y%m%d_%H%M%S')}.log")
+
+_log_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+_log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+_log_handler.setLevel(logging.DEBUG)
+
+logger = logging.getLogger("mcp_server")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(_log_handler)
+
+# 确保日志立即写入
+class FlushHandler(logging.Handler):
+    def emit(self, record):
+        _log_handler.emit(record)
+        _log_handler.flush()
+
+logger.addHandler(FlushHandler())
+
+# ============== 配置 ==============
 PORT_FILE = os.path.expanduser("~/.lldb_mcp_port")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 19527
+
+logger.info(f"MCP Server 启动, LOG_FILE={LOG_FILE}")
 
 
 def _get_port() -> int:
@@ -29,9 +57,12 @@ def _get_port() -> int:
     if os.path.exists(PORT_FILE):
         try:
             with open(PORT_FILE) as f:
-                return int(f.read().strip())
-        except:
-            pass
+                port = int(f.read().strip())
+                logger.debug(f"从 {PORT_FILE} 读取端口: {port}")
+                return port
+        except Exception as e:
+            logger.warning(f"读取端口文件失败: {e}")
+    logger.debug(f"使用默认端口: {DEFAULT_PORT}")
     return DEFAULT_PORT
 
 
@@ -42,9 +73,11 @@ def call_bridge(cmd: str, socket_timeout: float = 120.0, **args) -> str:
     """
     port = _get_port()
     if port == -1:
+        logger.error("找不到 Bridge 端口")
         return "错误: 找不到 Bridge 端口。请在 lldb 中执行: command script import lldbAiHelper_MCP_bridge.py"
     
     request = json.dumps({'cmd': cmd, 'args': args}, ensure_ascii=False) + '\n'
+    logger.info(f"call_bridge: cmd={cmd}, args={args}, port={port}")
     
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -61,24 +94,30 @@ def call_bridge(cmd: str, socket_timeout: float = 120.0, **args) -> str:
                 buf += data.decode('utf-8')
                 
             if not buf.strip():
+                logger.error("Bridge 无响应")
                 return "错误: Bridge 无响应"
                 
             result = json.loads(buf.split('\n')[0])
             if result.get('success'):
                 data = result.get('result')
+                logger.debug(f"call_bridge 成功: cmd={cmd}, result_type={type(data).__name__}")
                 if isinstance(data, dict):
                     return json.dumps(data, indent=2, ensure_ascii=False)
                 return str(data) if data is not None else "OK"
             else:
                 error = result.get('error', '未知错误')
                 tb = result.get('traceback', '')
+                logger.error(f"call_bridge 失败: cmd={cmd}, error={error}")
                 return f"错误: {error}" + (f"\n{tb}" if tb else "")
                 
     except ConnectionRefusedError:
+        logger.error(f"端口 {port} 拒绝连接")
         return f"错误: 端口 {port} 拒绝连接。请确认 lldb 中已执行 mcp_start"
     except socket.timeout:
+        logger.error(f"超时 ({socket_timeout}s)")
         return f"错误: 超时 ({socket_timeout}s)"
     except Exception as e:
+        logger.error(f"call_bridge 异常: {e}", exc_info=True)
         return f"错误: {e}"
 
 
@@ -179,7 +218,24 @@ def run_mcp_server():
             timeout: 超时秒数
             
         Returns:
-            停止原因和当前帧信息
+            JSON 结构包含:
+            - stopped: bool - 是否已停止
+            - reason: str - 停止原因 ("breakpoint", "breakpoint_condition_error", "watchpoint", "signal", "exception", "trace", "step_complete", "process_ended")
+            - stop_description: str - LLDB 原始停止描述（包含详细错误信息）
+            - frame_info: str - 当前帧信息
+            
+            当 reason="breakpoint" 时额外包含:
+            - breakpoint_id: int - 断点编号
+            - breakpoint_location_id: int - 断点位置编号
+            - condition: str - 条件表达式（如果有）
+            - condition_error: bool - 条件表达式是否求值出错
+            
+            当 reason="breakpoint_condition_error" 时:
+            - condition_error: true
+            - error_message: str - 详细错误信息（如 "undeclared identifier" 等语法错误）
+            
+            注意: reason="breakpoint_condition_error" 表示断点的条件表达式存在语法/求值错误，
+            进程是因为表达式出错而停止的，并非条件真正匹配。此时应检查并修正条件表达式。
         """
         # socket_timeout 需大于 Bridge 端的 wait 超时
         return call_bridge('wait_for_stop', socket_timeout=timeout + 10, timeout=timeout)
@@ -237,7 +293,123 @@ def run_mcp_server():
         expr = f'expression -l objc -O -- [NSClassFromString(@"{class_name}") _shortMethodDescription]'
         return call_bridge('execute', command=expr)
     
+    # ---- 高频调试命令 ----
+    
+    @mcp.tool()
+    def lldb_register_read(register: str = "") -> str:
+        """
+        读取寄存器值
+        
+        Args:
+            register: 寄存器名 (空=全部, "x0", "x1", "sp", "pc", "cpsr" 等)
+            
+        Examples:
+            lldb_register_read()        # 读取所有通用寄存器
+            lldb_register_read("x0")    # 读取 x0
+            lldb_register_read("sp")    # 读取栈指针
+        """
+        if register:
+            return call_bridge('execute', command=f'register read {register}')
+        return call_bridge('execute', command='register read')
+    
+    @mcp.tool()
+    def lldb_backtrace(count: int = 20) -> str:
+        """
+        获取调用栈
+        
+        Args:
+            count: 显示的栈帧数量 (默认 20)
+        """
+        return call_bridge('execute', command=f'bt {count}')
+    
+    @mcp.tool()
+    def lldb_breakpoint_set(address: str = "", name: str = "", condition: str = "", one_shot: bool = False) -> str:
+        """
+        设置断点
+        
+        Args:
+            address: 地址断点 (如 "0x100001234")
+            name: 符号/函数名断点 (如 "-[NSObject init]", "main")
+            condition: 条件表达式 (如 "$x0 == 0x1234")
+            one_shot: 是否一次性断点 (命中后自动删除)
+            
+        Examples:
+            lldb_breakpoint_set(address="0x100001234")
+            lldb_breakpoint_set(name="-[UIView setFrame:]")
+            lldb_breakpoint_set(address="0x100001234", condition="$x2 < 0x500")
+        """
+        if not address and not name:
+            return "错误: 必须指定 address 或 name"
+        
+        cmd = "breakpoint set"
+        if address:
+            cmd += f" -a {address}"
+        if name:
+            cmd += f' -n "{name}"'
+        if condition:
+            cmd += f" -c '{condition}'"
+        if one_shot:
+            cmd += " -o"
+        return call_bridge('execute', command=cmd)
+    
+    @mcp.tool()
+    def lldb_breakpoint_list() -> str:
+        """列出所有断点"""
+        return call_bridge('execute', command='breakpoint list')
+    
+    @mcp.tool()
+    def lldb_breakpoint_delete(breakpoint_id: str = "") -> str:
+        """
+        删除断点
+        
+        Args:
+            breakpoint_id: 断点ID (空=删除全部, "1"=删除1号, "1.2"=删除1号的第2个位置)
+        """
+        if breakpoint_id:
+            return call_bridge('execute', command=f'breakpoint delete {breakpoint_id}')
+        return call_bridge('execute', command='breakpoint delete')
+    
+    @mcp.tool()
+    def lldb_image_list(filter: str = "") -> str:
+        """
+        列出已加载的模块/动态库 (用于计算基地址)
+        
+        Args:
+            filter: 过滤关键字 (如 "libmtguard", "UIKit")
+            
+        Returns:
+            模块列表，包含基地址
+        """
+        logger.info(f"lldb_image_list: filter='{filter}'")
+        result = call_bridge('execute', command='image list')
+        if filter and not result.startswith("错误"):
+            # 在 Python 端过滤
+            lines = result.split('\n')
+            filtered = [l for l in lines if filter.lower() in l.lower()]
+            filtered_result = '\n'.join(filtered) if filtered else f"未找到包含 '{filter}' 的模块"
+            logger.info(f"lldb_image_list: 过滤后 {len(filtered)} 行")
+            return filtered_result
+        return result
+    
+    @mcp.tool()
+    def lldb_expression(expr: str, lang: str = "c") -> str:
+        """
+        求值表达式
+        
+        Args:
+            expr: 表达式
+            lang: 语言 - "c", "objc", "swift"
+            
+        Examples:
+            lldb_expression("$x0 + 0x10")
+            lldb_expression("[NSString stringWithFormat:@\"test\"]", lang="objc")
+        """
+        lang_map = {"c": "c++", "objc": "objc", "swift": "swift"}
+        l = lang_map.get(lang, "c++")
+        return call_bridge('execute', command=f'expression -l {l} -- {expr}')
+    
     print("[MCP] 启动中...", file=sys.stderr)
+    logger.info("MCP Server 准备运行 (stdio 模式)")
     mcp.run(transport='stdio')
 
 

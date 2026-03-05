@@ -1,6 +1,6 @@
 # lldbAiHelper_MCP
 
-* Update: `20260302`
+* Update: `20260305`
 
 ## Function
 
@@ -14,7 +14,11 @@ Features:
 - **Concurrent Threads**: Each request handled in independent thread, supporting parallel operations (e.g., `wait_for_stop` + `lldb_stop`)
 - **Auto Port**: Automatically finds available port (19527-19537), handshake via `~/.lldb_mcp_port`
 - **ObjC Support**: `po` and `_shortMethodDescription` for iOS class introspection
-- **Full Toolset**: 11 MCP tools covering execution control, memory, disassembly, flow control, and ObjC analysis
+- **Breakpoint Condition Error Detection**: `wait_for_stop` distinguishes between condition-matched breakpoint hits and condition expression parse/eval errors, preventing AI from misinterpreting syntax errors as successful matches
+- **Event-Based Wait**: `wait_for_stop` uses LLDB SBListener event mechanism instead of polling, more reliable and responsive
+- **File Logging**: Both MCP Server and Bridge write detailed logs to `logs/YYYYMMDD/` for debugging and troubleshooting
+- **Auto Confirm**: Bridge auto-sets `auto-confirm true` so AI-driven operations (e.g., `breakpoint delete`) won't block on user prompts
+- **Full Toolset**: 18 MCP tools covering execution control, memory, registers, breakpoints, disassembly, flow control, and ObjC analysis
 
 ## Git Repo
 
@@ -40,7 +44,11 @@ lldbAiHelper_MCP/
 ├── requirements.txt                  # Python dependencies (mcp[cli])
 ├── mcp_config_example.json           # AI client config example
 ├── lldbAiHelper_MCP.py               # MCP Server (AI client starts this)
-└── lldbAiHelper_MCP_bridge.py        # LLDB Bridge (loaded inside lldb)
+├── lldbAiHelper_MCP_bridge.py        # LLDB Bridge (loaded inside lldb)
+└── logs/                             # Runtime logs (auto-created, git-ignored)
+    └── YYYYMMDD/                     # Date-grouped log files
+        ├── mcp_server_*.log
+        └── lldb_bridge_*.log
 ```
 
 ## Prerequisites
@@ -78,6 +86,8 @@ Output:
 [Bridge] 已启动，监听 127.0.0.1:19527
 [Bridge] 端口已写入 /Users/xxx/.lldb_mcp_port
 [Bridge] 命令已注册: mcp_status, mcp_stop, mcp_restart
+[Bridge] 已设置 auto-confirm=true (自动确认删除等操作)
+[Bridge] 日志文件: /path/to/logs/YYYYMMDD/lldb_bridge_*.log
 ```
 
 To auto-load on every LLDB session, add to `~/.lldbinit`:
@@ -136,10 +146,17 @@ Available commands inside LLDB after loading the Bridge:
 | `lldb_disassemble(target, count)` | Disassemble (current PC, function name, or address) |
 | `lldb_continue()` | Resume execution (async, returns immediately) |
 | `lldb_stop()` | Pause running process |
-| `lldb_wait_stop(timeout)` | Wait for stop event (breakpoint/exception/step complete) |
+| `lldb_wait_stop(timeout)` | Wait for stop event; distinguishes normal breakpoint hits vs condition expression errors |
 | `lldb_flow_control(action)` | Step control: next/step/finish/ni/si |
 | `lldb_po(expression)` | Print ObjC object description |
 | `lldb_objc_class_info(class_name)` | Get ObjC class methods (`_shortMethodDescription`) |
+| `lldb_register_read(register)` | Read registers (all or specific) |
+| `lldb_backtrace(count)` | Get call stack |
+| `lldb_breakpoint_set(address, name, condition, one_shot)` | Set breakpoint (by address, symbol, or with condition) |
+| `lldb_breakpoint_list()` | List all breakpoints |
+| `lldb_breakpoint_delete(breakpoint_id)` | Delete breakpoint(s) |
+| `lldb_image_list(filter)` | List loaded modules/dylibs (for base address calculation) |
+| `lldb_expression(expr, lang)` | Evaluate expression (C/ObjC/Swift) |
 
 ## Design Notes
 
