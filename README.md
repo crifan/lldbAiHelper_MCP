@@ -1,6 +1,6 @@
 # lldbAiHelper_MCP
 
-* Update: `20260305`
+* Update: `20260416`
 
 ## Function
 
@@ -10,15 +10,18 @@ Features:
 
 - **Dual-File Architecture**: LLDB-side Bridge + Independent MCP Server, cleanly separated
 - **Short Connection**: Stateless per-request TCP, Bridge crash/restart won't affect MCP Server
-- **Async Continue**: Non-blocking `continue` + `wait_for_stop`, allowing parallel `stop` even during long-running execution
+- **Async Continue**: Non-blocking `continue` + `wait_for_stop`, allowing parallel `stop` even during long-running execution. Uses `HandleCommand` for proper breakpoint callback dispatch
 - **Concurrent Threads**: Each request handled in independent thread, supporting parallel operations (e.g., `wait_for_stop` + `lldb_stop`)
+- **Smart Async Management**: Bridge tracks process running state and only toggles LLDB's async mode when safe, preventing state desynchronization
+- **Auto-Continue Aware**: `wait_for_stop` detects transient stops from auto-continue breakpoints, avoiding false stop reports
 - **Auto Port**: Automatically finds available port (19527-19537), handshake via `~/.lldb_mcp_port`
 - **ObjC Support**: `po` and `_shortMethodDescription` for iOS class introspection
 - **Breakpoint Condition Error Detection**: `wait_for_stop` distinguishes between condition-matched breakpoint hits and condition expression parse/eval errors, preventing AI from misinterpreting syntax errors as successful matches
 - **Event-Based Wait**: `wait_for_stop` uses LLDB SBListener event mechanism instead of polling, more reliable and responsive
 - **File Logging**: Both MCP Server and Bridge write detailed logs to `logs/YYYYMMDD/` for debugging and troubleshooting
 - **Auto Confirm**: Bridge auto-sets `auto-confirm true` so AI-driven operations (e.g., `breakpoint delete`) won't block on user prompts
-- **Full Toolset**: 18 MCP tools covering execution control, memory, registers, breakpoints, disassembly, flow control, and ObjC analysis
+- **Batch Operations**: Register read supports comma-separated batch (e.g., `"x0,x1,sp,pc"`); dedicated batch tools for memory read, breakpoint set/delete reduce MCP round-trips
+- **Full Toolset**: 21 MCP tools covering execution control, memory, registers, breakpoints, disassembly, flow control, ObjC analysis, and batch operations
 
 ## Git Repo
 
@@ -150,13 +153,16 @@ Available commands inside LLDB after loading the Bridge:
 | `lldb_flow_control(action)` | Step control: next/step/finish/ni/si |
 | `lldb_po(expression)` | Print ObjC object description |
 | `lldb_objc_class_info(class_name)` | Get ObjC class methods (`_shortMethodDescription`) |
-| `lldb_register_read(register)` | Read registers (all or specific) |
+| `lldb_register_read(register)` | Read registers (all, specific, or comma-separated batch: `"x0,x1,sp,pc"`) |
 | `lldb_backtrace(count)` | Get call stack |
 | `lldb_breakpoint_set(address, name, condition, one_shot)` | Set breakpoint (by address, symbol, or with condition) |
 | `lldb_breakpoint_list()` | List all breakpoints |
 | `lldb_breakpoint_delete(breakpoint_id)` | Delete breakpoint(s) |
 | `lldb_image_list(filter)` | List loaded modules/dylibs (for base address calculation) |
 | `lldb_expression(expr, lang)` | Evaluate expression (C/ObjC/Swift) |
+| `lldb_memory_read_batch(addresses, count, format)` | Batch read memory at multiple comma-separated addresses |
+| `lldb_breakpoint_set_batch(addresses, condition, one_shot)` | Batch set breakpoints at multiple comma-separated addresses |
+| `lldb_breakpoint_delete_batch(breakpoint_ids)` | Batch delete multiple comma-separated breakpoint IDs |
 
 ## Design Notes
 
@@ -177,3 +183,12 @@ Available commands inside LLDB after loading the Bridge:
 - `continue` may block indefinitely (anti-debug, deadloop, waiting for user input)
 - Async `continue` returns immediately; AI uses `wait_for_stop` in separate thread to poll
 - AI can call `lldb_stop()` concurrently to interrupt, even while `wait_for_stop` is pending
+- Uses `HandleCommand("process continue")` instead of `process.Continue()` Python API to ensure breakpoint callbacks (`breakpoint command add -F/-o`) are properly dispatched through LLDB's command interpreter event chain
+
+### Async Mode Management (State Desync Prevention)
+
+- LLDB's `SetAsync()` is a **global** debugger setting; toggling it from multiple concurrent threads causes state corruption
+- Bridge tracks `_process_continued` flag: set `True` after `continue_async`, cleared when process stops
+- `_cmd_execute` only forces `SetAsync(False)` when process is NOT running, preventing async mode interference while process is in flight
+- `wait_for_stop` restores `SetAsync(False)` when process stops, ensuring subsequent commands work in sync mode
+- Auto-continue breakpoints cause transient stopped states; `wait_for_stop` waits 50ms to confirm process truly stopped before reporting

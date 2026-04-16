@@ -178,6 +178,30 @@ def run_mcp_server():
         fmt_map = {'x': 'x', 's': 's', 'i': 'i', 'p': 'A', 'b': 'Y'}
         fmt = fmt_map.get(format, 'x')
         return call_bridge('execute', command=f'memory read -c {count} -f {fmt} {address}')
+    
+    @mcp.tool()
+    def lldb_memory_read_batch(addresses: str, count: int = 256, format: str = "x") -> str:
+        """
+        批量读取多个地址的内存
+        
+        Args:
+            addresses: 逗号分隔的地址列表 (如 "0x100001234,$x0,$sp")
+            count: 每个地址读取的字节数 (默认 256)
+            format: 格式 - "x"(hex), "s"(string), "i"(instruction/disasm), "p"(pointer), "b"(binary)
+            
+        Examples:
+            lldb_memory_read_batch("0x100001234,0x100005678")
+            lldb_memory_read_batch("$x0,$sp,$x1", count=64, format="x")
+        """
+        addr_list = [a.strip() for a in addresses.split(',') if a.strip()]
+        if not addr_list:
+            return "错误: addresses 为空"
+        
+        fmt_map = {'x': 'x', 's': 's', 'i': 'i', 'p': 'A', 'b': 'Y'}
+        fmt = fmt_map.get(format, 'x')
+        commands = [f'memory read -c {count} -f {fmt} {addr}' for addr in addr_list]
+        logger.info(f"lldb_memory_read_batch: {len(addr_list)} 个地址: {addresses[:120]}")
+        return call_bridge('execute_batch', commands=commands, labels=addr_list)
         
     # ---- 反汇编 ----
     
@@ -298,18 +322,20 @@ def run_mcp_server():
     @mcp.tool()
     def lldb_register_read(register: str = "") -> str:
         """
-        读取寄存器值
+        读取寄存器值（支持批量）
         
         Args:
-            register: 寄存器名 (空=全部, "x0", "x1", "sp", "pc", "cpsr" 等)
+            register: 寄存器名，支持逗号分隔批量读取 (空=全部, "x0", "x0,x1,sp,pc" 等)
             
         Examples:
-            lldb_register_read()        # 读取所有通用寄存器
-            lldb_register_read("x0")    # 读取 x0
-            lldb_register_read("sp")    # 读取栈指针
+            lldb_register_read()              # 读取所有通用寄存器
+            lldb_register_read("x0")          # 读取 x0
+            lldb_register_read("x0,x1,x8,sp") # 批量读取多个寄存器
         """
         if register:
-            return call_bridge('execute', command=f'register read {register}')
+            # 支持逗号分隔的批量读取: "x0,x1,sp" → "register read x0 x1 sp"
+            regs = ' '.join(r.strip() for r in register.split(',') if r.strip())
+            return call_bridge('execute', command=f'register read {regs}')
         return call_bridge('execute', command='register read')
     
     @mcp.tool()
@@ -353,6 +379,36 @@ def run_mcp_server():
         return call_bridge('execute', command=cmd)
     
     @mcp.tool()
+    def lldb_breakpoint_set_batch(addresses: str, condition: str = "", one_shot: bool = False) -> str:
+        """
+        批量设置断点（按地址）
+        
+        Args:
+            addresses: 逗号分隔的地址列表 (如 "0x100001234,0x100005678,0x10000abcd")
+            condition: 条件表达式，应用到所有断点 (如 "$x0 == 0x1234")
+            one_shot: 是否一次性断点
+            
+        Examples:
+            lldb_breakpoint_set_batch("0x100001234,0x100005678")
+            lldb_breakpoint_set_batch("0x100001234,0x100005678", condition="$x0 > 0")
+        """
+        addr_list = [a.strip() for a in addresses.split(',') if a.strip()]
+        if not addr_list:
+            return "错误: addresses 为空"
+        
+        commands = []
+        for addr in addr_list:
+            cmd = f"breakpoint set -a {addr}"
+            if condition:
+                cmd += f" -c '{condition}'"
+            if one_shot:
+                cmd += " -o"
+            commands.append(cmd)
+        
+        logger.info(f"lldb_breakpoint_set_batch: {len(addr_list)} 个地址: {addresses[:120]}")
+        return call_bridge('execute_batch', commands=commands, labels=addr_list)
+    
+    @mcp.tool()
     def lldb_breakpoint_list() -> str:
         """列出所有断点"""
         return call_bridge('execute', command='breakpoint list')
@@ -368,6 +424,26 @@ def run_mcp_server():
         if breakpoint_id:
             return call_bridge('execute', command=f'breakpoint delete {breakpoint_id}')
         return call_bridge('execute', command='breakpoint delete')
+    
+    @mcp.tool()
+    def lldb_breakpoint_delete_batch(breakpoint_ids: str) -> str:
+        """
+        批量删除断点
+        
+        Args:
+            breakpoint_ids: 逗号分隔的断点ID列表 (如 "1,2,3" 或 "1.2,3.1")
+            
+        Examples:
+            lldb_breakpoint_delete_batch("1,2,3")
+            lldb_breakpoint_delete_batch("1.2,3.1,5")
+        """
+        id_list = [i.strip() for i in breakpoint_ids.split(',') if i.strip()]
+        if not id_list:
+            return "错误: breakpoint_ids 为空"
+        
+        commands = [f'breakpoint delete {bid}' for bid in id_list]
+        logger.info(f"lldb_breakpoint_delete_batch: {len(id_list)} 个断点: {breakpoint_ids[:120]}")
+        return call_bridge('execute_batch', commands=commands, labels=id_list)
     
     @mcp.tool()
     def lldb_image_list(filter: str = "") -> str:

@@ -76,6 +76,7 @@ class LLDBBridge:
         self.server_socket: Optional[socket.socket] = None
         self.running = False
         self.exec_lock = threading.Lock()  # 保护 lldb 命令执行的串行化
+        self._process_continued = False   # 进程是否处于 continue 运行态（continue_async 后为 True，停止后为 False）
         
     def start(self) -> bool:
         """启动 Socket Server（自动探测可用端口）"""
@@ -219,11 +220,15 @@ class LLDBBridge:
         return "pong"
         
     def _cmd_execute(self, command: str) -> str:
-        """执行 lldb 命令（同步模式 + 串行化）"""
+        """执行 lldb 命令（串行化 + 智能 async 管理）"""
         logger.info(f"execute: 执行命令 '{command}'")
         with self.exec_lock:
+            # 关键修复: 仅在进程非运行态时切换同步模式
+            # 进程运行中切换 SetAsync 会导致 LLDB 内部事件处理状态不一致（state desync）
+            should_force_sync = not self._process_continued
             orig_async = self.debugger.GetAsync()
-            self.debugger.SetAsync(False)
+            if should_force_sync:
+                self.debugger.SetAsync(False)
             try:
                 result = lldb.SBCommandReturnObject()
                 self.debugger.GetCommandInterpreter().HandleCommand(command, result)
@@ -234,10 +239,41 @@ class LLDBBridge:
                 if result.GetError():
                     output += result.GetError()
                 final_output = output.rstrip() if output.strip() else "[执行成功: 该命令无终端输出]"
-                logger.debug(f"execute: 命令 '{command}' 输出长度={len(final_output)}")
+                logger.debug(f"execute: 命令 '{command}' 输出长度={len(final_output)}, force_sync={should_force_sync}")
                 return final_output
             finally:
-                self.debugger.SetAsync(orig_async)
+                if should_force_sync:
+                    self.debugger.SetAsync(orig_async)
+    
+    def _cmd_execute_batch(self, commands: list, labels: list = None) -> str:
+        """批量执行多个 lldb 命令（一次锁获取，一次连接）"""
+        logger.info(f"execute_batch: 批量执行 {len(commands)} 个命令")
+        with self.exec_lock:
+            should_force_sync = not self._process_continued
+            orig_async = self.debugger.GetAsync()
+            if should_force_sync:
+                self.debugger.SetAsync(False)
+            try:
+                results = []
+                for i, command in enumerate(commands):
+                    label = labels[i] if labels and i < len(labels) else command
+                    result = lldb.SBCommandReturnObject()
+                    self.debugger.GetCommandInterpreter().HandleCommand(command, result)
+                    
+                    output = ""
+                    if result.GetOutput():
+                        output += result.GetOutput()
+                    if result.GetError():
+                        output += result.GetError()
+                    output = output.rstrip() if output.strip() else "[无输出]"
+                    results.append(f"=== {label} ===\n{output}")
+                
+                combined = "\n\n".join(results)
+                logger.debug(f"execute_batch: {len(commands)} 个命令完成, 总输出长度={len(combined)}")
+                return combined
+            finally:
+                if should_force_sync:
+                    self.debugger.SetAsync(orig_async)
             
     def _cmd_get_status(self) -> Dict[str, Any]:
         """获取结构化的调试状态"""
@@ -301,23 +337,32 @@ class LLDBBridge:
             state_before = process.GetState()
             logger.info(f"continue_async: 执行前状态={state_before}, pid={process.GetProcessID()}")
             
-            # 关键：必须设为异步模式，否则 Continue() 会阻塞等待进程停止
+            # 关键：必须设为异步模式，否则 HandleCommand("continue") 会阻塞等待进程停止
             orig_async = self.debugger.GetAsync()
             logger.info(f"continue_async: orig_async={orig_async}, 设置为 True")
             self.debugger.SetAsync(True)
             
             try:
-                error = process.Continue()
-                state_after = process.GetState()
-                logger.info(f"continue_async: Continue() 返回 error.Success()={error.Success()}, error={error}, 状态={state_after}")
+                # 关键修复: 使用 HandleCommand 而非 process.Continue()
+                # 通过命令解释器执行 continue 确保:
+                # 1. 断点回调 (breakpoint command add -F/-o) 能被正确调度
+                # 2. LLDB 内部事件处理链完整（包括 auto-continue 逻辑）
+                cmd_result = lldb.SBCommandReturnObject()
+                self.debugger.GetCommandInterpreter().HandleCommand('process continue', cmd_result)
                 
-                if error.Success():
+                state_after = process.GetState()
+                logger.info(f"continue_async: HandleCommand('process continue') succeeded={cmd_result.Succeeded()}, 状态={state_after}")
+                
+                if cmd_result.Succeeded():
+                    self._process_continued = True
                     return {'success': True, 'message': '进程已继续执行', 'state': state_after}
-                return {'success': False, 'error': str(error)}
-            finally:
-                # 注意：不要立即恢复 async 模式，让进程继续运行
-                # self.debugger.SetAsync(orig_async)
-                logger.info(f"continue_async: 保持 async=True (不恢复为 {orig_async})")
+                
+                error_msg = cmd_result.GetError() or '继续执行失败'
+                logger.error(f"continue_async: 失败: {error_msg}")
+                return {'success': False, 'error': error_msg}
+            except Exception as e:
+                logger.error(f"continue_async: 异常: {e}", exc_info=True)
+                return {'success': False, 'error': str(e)}
             
     def _cmd_stop_process(self) -> Dict[str, Any]:
         """暂停进程"""
@@ -340,6 +385,9 @@ class LLDBBridge:
             logger.info(f"stop_process: Stop() 返回 error.Success()={error.Success()}, 状态={state_after}")
             
             if error.Success():
+                # 恢复同步模式，标记进程已停止
+                self._process_continued = False
+                self.debugger.SetAsync(False)
                 return {'success': True, 'message': '进程已暂停'}
             return {'success': False, 'error': str(error)}
                 
@@ -377,6 +425,19 @@ class LLDBBridge:
             logger.debug(f"wait_for_stop: 当前状态={state}")
             
             if state == lldb.eStateStopped:
+                # 关键修复: 等待一小段时间，确认不是 auto-continue 的瞬时停止
+                # auto-continue 断点或回调返回 False 会让进程瞬时停止后立即恢复运行
+                # 如果不做此检查，会误报为真正停止，后续命令与实际运行状态不一致（state desync）
+                time.sleep(0.05)  # 50ms 等待 auto-continue 生效
+                recheck_state = process.GetState()
+                if recheck_state != lldb.eStateStopped:
+                    logger.info(f"wait_for_stop: 瞬时停止后恢复运行 (state={recheck_state}), 继续等待 (auto-continue)")
+                    continue
+                
+                # 恢复同步模式，标记进程已停止
+                self._process_continued = False
+                self.debugger.SetAsync(False)
+                
                 thread = process.GetSelectedThread()
                 reason = thread.GetStopReason() if thread.IsValid() else lldb.eStopReasonNone
                 logger.info(f"wait_for_stop: 进程已停止, reason={reason}")
@@ -414,6 +475,8 @@ class LLDBBridge:
                 logger.info(f"wait_for_stop: 返回 result={result}")
                 return result
             elif state in [lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached]:
+                self._process_continued = False
+                self.debugger.SetAsync(False)
                 logger.info(f"wait_for_stop: 进程已结束, state={state}")
                 return {'stopped': True, 'reason': 'process_ended'}
             
@@ -424,6 +487,9 @@ class LLDBBridge:
                     new_state = lldb.SBProcess.GetStateFromEvent(event)
                     logger.info(f"wait_for_stop: 收到事件, new_state={new_state}")
             
+        # 超时：恢复状态
+        self._process_continued = False
+        self.debugger.SetAsync(False)
         logger.warning(f"wait_for_stop: 超时 ({timeout}s)")
         return {'stopped': False, 'error': f'等待超时 ({timeout}s)'}
     
