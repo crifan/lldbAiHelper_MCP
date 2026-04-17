@@ -1,12 +1,16 @@
 # lldbAiHelper_MCP
 
-* Update: `20260416`
+* Update: `20260417`
 
-## Function
+## Intro
 
-LLDB MCP (Model Context Protocol) Bridge + Server, enabling AI assistants (Qoder, Cursor, Claude, etc.) to directly interact with LLDB debugger for iOS/Android reverse engineering and dynamic analysis.
+LLDB `MCP` (Model Context Protocol) Bridge + Server, enabling AI assistants (Qoder, Cursor, Claude, etc.) to directly interact with LLDB debugger for iOS/Android reverse engineering and dynamic analysis.
 
-Features:
+## Usage Effect
+
+![lldb_mcp_qoder_effect](./docs/img/lldb_mcp_qoder_effect.jpg)
+
+## Features
 
 - **Dual-File Architecture**: LLDB-side Bridge + Independent MCP Server, cleanly separated
 - **Short Connection**: Stateless per-request TCP, Bridge crash/restart won't affect MCP Server
