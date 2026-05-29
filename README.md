@@ -1,6 +1,6 @@
 # lldbAiHelper_MCP
 
-* Update: `20260417`
+* Update: `20260529`
 
 ## Intro
 
@@ -15,6 +15,9 @@ LLDB `MCP` (Model Context Protocol) Bridge + Server, enabling AI assistants (Qod
 - **Dual-File Architecture**: LLDB-side Bridge + Independent MCP Server, cleanly separated
 - **Short Connection**: Stateless per-request TCP, Bridge crash/restart won't affect MCP Server
 - **Async Continue**: Non-blocking `continue` + `wait_for_stop`, allowing parallel `stop` even during long-running execution. Uses `HandleCommand` for proper breakpoint callback dispatch
+- **Async Step**: Non-blocking `nexti/stepi/next/step/finish` via `step_async` + `wait_for_stop`, same pattern as async continue. Step commands never hold the global lock during execution
+- **Preemptible Interrupt**: `lldb_stop` does NOT require `exec_lock`, so it can interrupt a pending step/continue at any time — even while another command thread holds the lock
+- **Continue Resume Validation**: `continue_async` verifies the process actually entered running state after `HandleCommand`; returns `did_not_resume` if process remains stopped
 - **Concurrent Threads**: Each request handled in independent thread, supporting parallel operations (e.g., `wait_for_stop` + `lldb_stop`)
 - **Smart Async Management**: Bridge tracks process running state and only toggles LLDB's async mode when safe, preventing state desynchronization
 - **Auto-Continue Aware**: `wait_for_stop` detects transient stops from auto-continue breakpoints, avoiding false stop reports
@@ -23,6 +26,8 @@ LLDB `MCP` (Model Context Protocol) Bridge + Server, enabling AI assistants (Qod
 - **Breakpoint Condition Error Detection**: `wait_for_stop` distinguishes between condition-matched breakpoint hits and condition expression parse/eval errors, preventing AI from misinterpreting syntax errors as successful matches
 - **Event-Based Wait**: `wait_for_stop` uses LLDB SBListener event mechanism instead of polling, more reliable and responsive
 - **File Logging**: Both MCP Server and Bridge write detailed logs to `logs/YYYYMMDD/` for debugging and troubleshooting
+- **Bridge Disconnect Diagnostics**: When Bridge connection fails, MCP Server automatically collects port file status and recent Bridge log tail for diagnosis; Bridge records process state on exit
+- **Structured Stop Reason**: `wait_for_stop` returns stable string reason (never raw enum numbers), always includes `thread_id`, `pc`, `process_state` as structured fields
 - **Auto Confirm**: Bridge auto-sets `auto-confirm true` so AI-driven operations (e.g., `breakpoint delete`) won't block on user prompts
 - **Batch Operations**: Register read supports comma-separated batch (e.g., `"x0,x1,sp,pc"`); dedicated batch tools for memory read, breakpoint set/delete reduce MCP round-trips
 - **Full Toolset**: 21 MCP tools covering execution control, memory, registers, breakpoints, disassembly, flow control, ObjC analysis, and batch operations
@@ -154,7 +159,7 @@ Available commands inside LLDB after loading the Bridge:
 | `lldb_continue()` | Resume execution (async, returns immediately) |
 | `lldb_stop()` | Pause running process |
 | `lldb_wait_stop(timeout)` | Wait for stop event; distinguishes normal breakpoint hits vs condition expression errors |
-| `lldb_flow_control(action)` | Step control: next/step/finish/ni/si |
+| `lldb_flow_control(action)` | Step control: next/step/finish/ni/si (async, non-blocking, preemptible by `lldb_stop`) |
 | `lldb_po(expression)` | Print ObjC object description |
 | `lldb_objc_class_info(class_name)` | Get ObjC class methods (`_shortMethodDescription`) |
 | `lldb_register_read(register)` | Read registers (all, specific, or comma-separated batch: `"x0,x1,sp,pc"`) |
@@ -188,6 +193,31 @@ Available commands inside LLDB after loading the Bridge:
 - Async `continue` returns immediately; AI uses `wait_for_stop` in separate thread to poll
 - AI can call `lldb_stop()` concurrently to interrupt, even while `wait_for_stop` is pending
 - Uses `HandleCommand("process continue")` instead of `process.Continue()` Python API to ensure breakpoint callbacks (`breakpoint command add -F/-o`) are properly dispatched through LLDB's command interpreter event chain
+
+### Why Async Step?
+
+- Synchronous `nexti/stepi` (via `_cmd_execute`) holds the global `exec_lock` until the step completes, blocking ALL other commands including `lldb_stop` and `lldb_status`
+- `step_async` uses the same async pattern as `continue_async`: `SetAsync(True)` + `HandleCommand` returns immediately, then `wait_for_stop` waits for completion
+- The `exec_lock` is released right after `HandleCommand` returns, not held during step execution
+- `lldb_flow_control` in MCP Server automatically chains `step_async` + `wait_for_stop`, so AI usage remains simple
+
+### Why Preemptible Interrupt?
+
+- `lldb_stop` (`_cmd_stop_process`) does NOT acquire `exec_lock`, so it can interrupt at any time
+- Even if `step_async` or `continue_async` holds the lock, `lldb_stop` can concurrently call `process.Stop()`
+- `lldb_status` (`_cmd_get_status`) also does NOT acquire the lock — read-only LLDB SB API calls are thread-safe
+- `_cmd_execute` / `_cmd_execute_batch` use `exec_lock.acquire(timeout=10)` instead of `with self.exec_lock`, so they fail fast instead of blocking indefinitely when the lock is held
+
+### Continue Resume Validation
+
+- `HandleCommand("process continue")` may return `Succeeded=True` even when the process remains stopped (e.g., auto-continue callback failure)
+- `continue_async` checks `state_after` — if still stopped, returns `did_not_resume: true` with `stop_description` instead of falsely reporting success
+
+### Structured Stop Reason
+
+- `wait_for_stop` maps ALL LLDB `eStopReason` enum values to stable strings (e.g., `"trace"`, `"breakpoint"`, `"signal"`), never raw numbers like `"1"`
+- Unknown enum values use `"unknown_N"` format instead of bare integers
+- Return always includes `thread_id`, `pc`, `process_state` as top-level structured fields — no need to parse `frame_info` string
 
 ### Async Mode Management (State Desync Prevention)
 

@@ -66,6 +66,50 @@ def _get_port() -> int:
     return DEFAULT_PORT
 
 
+def _get_bridge_diagnostics() -> str:
+    """
+    Bridge 连接失败时的诊断信息收集：
+    - 端口文件是否存在
+    - 最近 bridge 日志的最后几行（可能含退出栈/异常信息）
+    """
+    diag_parts = []
+    
+    # 检查端口文件
+    if os.path.exists(PORT_FILE):
+        try:
+            with open(PORT_FILE) as f:
+                port = f.read().strip()
+            diag_parts.append(f"端口文件存在: port={port}")
+        except Exception as e:
+            diag_parts.append(f"端口文件读取失败: {e}")
+    else:
+        diag_parts.append("端口文件不存在（Bridge 可能已退出或未启动）")
+    
+    # 尝试读取最近的 bridge 日志尾部
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        if os.path.isdir(log_dir):
+            # 找到最新的日期子目录
+            date_dirs = sorted([d for d in os.listdir(log_dir) if os.path.isdir(os.path.join(log_dir, d))], reverse=True)
+            if date_dirs:
+                latest_dir = os.path.join(log_dir, date_dirs[0])
+                bridge_logs = sorted(
+                    [f for f in os.listdir(latest_dir) if f.startswith("lldb_bridge_")],
+                    reverse=True
+                )
+                if bridge_logs:
+                    log_path = os.path.join(latest_dir, bridge_logs[0])
+                    with open(log_path, encoding='utf-8', errors='replace') as f:
+                        lines = f.readlines()
+                    tail = "".join(lines[-10:]).strip()
+                    if tail:
+                        diag_parts.append(f"最近 Bridge 日志({bridge_logs[0]})尾部:\n{tail}")
+    except Exception as e:
+        diag_parts.append(f"日志读取失败: {e}")
+    
+    return "\n".join(diag_parts)
+
+
 def call_bridge(cmd: str, socket_timeout: float = 120.0, **args) -> str:
     """
     发送命令到 Bridge（短连接：每次新建，用完关闭）
@@ -112,10 +156,12 @@ def call_bridge(cmd: str, socket_timeout: float = 120.0, **args) -> str:
                 
     except ConnectionRefusedError:
         logger.error(f"端口 {port} 拒绝连接")
-        return f"错误: 端口 {port} 拒绝连接。请确认 lldb 中已执行 mcp_start"
+        diag = _get_bridge_diagnostics()
+        return f"错误: 端口 {port} 拒绝连接。Bridge 进程可能已退出（lldb 关闭/崩溃/重启）。\n--- Bridge 诊断 ---\n{diag}"
     except socket.timeout:
         logger.error(f"超时 ({socket_timeout}s)")
-        return f"错误: 超时 ({socket_timeout}s)"
+        diag = _get_bridge_diagnostics()
+        return f"错误: 超时 ({socket_timeout}s)。Bridge 可能卡住或进程状态异常。\n--- Bridge 诊断 ---\n{diag}"
     except Exception as e:
         logger.error(f"call_bridge 异常: {e}", exc_info=True)
         return f"错误: {e}"
@@ -269,6 +315,10 @@ def run_mcp_server():
         """
         控制执行流（单步等）
         
+        使用异步步进模式：先 step_async 发出步进指令，再 wait_for_stop 等待完成。
+        这样 Bridge 端不会因步骤执行而长期持有 exec_lock，
+        在步骤执行期间 lldb_stop/lldb_status 仍可并发调用。
+        
         Args:
             action: 动作
                 - "next" / "n": 源码级步过
@@ -277,17 +327,29 @@ def run_mcp_server():
                 - "nexti" / "ni": 汇编级步过
                 - "stepi" / "si": 汇编级步入
         """
+        # 统一映射为 Bridge 侧的 action 名称
         action_map = {
             "next": "next", "n": "next",
             "step": "step", "s": "step",
             "finish": "finish",
-            "nexti": "ni", "ni": "ni",
-            "stepi": "si", "si": "si",
+            "nexti": "nexti", "ni": "nexti",
+            "stepi": "stepi", "si": "stepi",
         }
-        cmd = action_map.get(action.lower())
-        if not cmd:
+        normalized = action_map.get(action.lower())
+        if not normalized:
             return f"无效动作: {action}。可选: next, step, finish, nexti, stepi"
-        return call_bridge('execute', command=cmd)
+        
+        # 第1步：异步发出步进指令（Bridge 端立即返回，不阻塞 exec_lock）
+        step_result = call_bridge('step_async', action=normalized)
+        
+        # 检查 step_async 是否成功（call_bridge 对 success=False 返回 "错误: ..." 前缀）
+        if step_result.startswith("错误"):
+            return step_result
+        
+        # 第2步：等待步骤完成（wait_for_stop 不持有 exec_lock，可被 lldb_stop 打断）
+        wait_result = call_bridge('wait_for_stop', timeout=30.0)
+        
+        return f"{step_result}\n---\n{wait_result}"
     
     # ---- iOS/ObjC 逆向专属 ----
     

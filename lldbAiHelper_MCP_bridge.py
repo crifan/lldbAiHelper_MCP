@@ -123,8 +123,35 @@ class LLDBBridge:
             return False
             
     def stop(self):
-        """停止 Server"""
+        """停止 Server（记录退出诊断信息）"""
         self.running = False
+        
+        # 记录退出诊断信息：LLDB 进程状态、最后命令等
+        try:
+            diag_parts = []
+            if self.debugger:
+                target = self.debugger.GetSelectedTarget()
+                if target and target.IsValid():
+                    process = target.GetProcess()
+                    if process and process.IsValid():
+                        state = process.GetState()
+                        pid = process.GetProcessID()
+                        diag_parts.append(f"pid={pid}, state={state}")
+                        if state == lldb.eStateStopped:
+                            thread = process.GetSelectedThread()
+                            if thread and thread.IsValid():
+                                pc = thread.GetSelectedFrame().GetPC() if thread.GetSelectedFrame().IsValid() else 0
+                                diag_parts.append(f"tid={thread.GetThreadID()}, pc=0x{pc:x}")
+                    else:
+                        diag_parts.append("process 无效")
+                else:
+                    diag_parts.append("target 无效")
+            diag_str = ", ".join(diag_parts) if diag_parts else "无诊断信息"
+            logger.warning(f"Bridge 正在停止, 诊断: {diag_str}")
+            print(f"[Bridge] 退出诊断: {diag_str}")
+        except Exception as e:
+            logger.warning(f"Bridge 停止时诊断失败: {e}")
+        
         if self.server_socket:
             try:
                 self.server_socket.close()
@@ -177,8 +204,22 @@ class LLDBBridge:
                 client.sendall((json.dumps(response, ensure_ascii=False) + '\n').encode('utf-8'))
         except Exception as e:
             if self.running:
+                # 增强错误归因：记录异常栈和 LLDB 状态快照
+                tb = traceback.format_exc()
+                logger.error(f"_handle_request 异常: {e}\n{tb}")
                 try:
-                    err = json.dumps({'success': False, 'error': str(e)}) + '\n'
+                    # 尝试获取 LLDB 进程状态用于诊断
+                    diag = ""
+                    try:
+                        if self.debugger:
+                            tgt = self.debugger.GetSelectedTarget()
+                            if tgt and tgt.IsValid():
+                                proc = tgt.GetProcess()
+                                if proc and proc.IsValid():
+                                    diag = f" [lldb state={proc.GetState()}, pid={proc.GetProcessID()}]"
+                    except:
+                        pass
+                    err = json.dumps({'success': False, 'error': f'{e}{diag}', 'traceback': tb}) + '\n'
                     client.sendall(err.encode('utf-8'))
                 except:
                     pass
@@ -220,9 +261,13 @@ class LLDBBridge:
         return "pong"
         
     def _cmd_execute(self, command: str) -> str:
-        """执行 lldb 命令（串行化 + 智能 async 管理）"""
+        """执行 lldb 命令（串行化 + 智能 async 管理 + 超时保护）"""
         logger.info(f"execute: 执行命令 '{command}'")
-        with self.exec_lock:
+        # 超时保护：如果另一个命令正在执行（如 step），不无限期等待
+        if not self.exec_lock.acquire(timeout=10):
+            logger.warning(f"execute: 无法获取 exec_lock (10s 超时)，命令 '{command}' 被拒绝")
+            return "[错误: 另一个命令正在执行中，请稍后重试。如需中断，请使用 lldb_stop]"
+        try:
             # 关键修复: 仅在进程非运行态时切换同步模式
             # 进程运行中切换 SetAsync 会导致 LLDB 内部事件处理状态不一致（state desync）
             should_force_sync = not self._process_continued
@@ -244,11 +289,16 @@ class LLDBBridge:
             finally:
                 if should_force_sync:
                     self.debugger.SetAsync(orig_async)
+        finally:
+            self.exec_lock.release()
     
     def _cmd_execute_batch(self, commands: list, labels: list = None) -> str:
-        """批量执行多个 lldb 命令（一次锁获取，一次连接）"""
+        """批量执行多个 lldb 命令（一次锁获取，一次连接 + 超时保护）"""
         logger.info(f"execute_batch: 批量执行 {len(commands)} 个命令")
-        with self.exec_lock:
+        if not self.exec_lock.acquire(timeout=10):
+            logger.warning(f"execute_batch: 无法获取 exec_lock (10s 超时)，批量命令被拒绝")
+            return "[错误: 另一个命令正在执行中，请稍后重试。如需中断，请使用 lldb_stop]"
+        try:
             should_force_sync = not self._process_continued
             orig_async = self.debugger.GetAsync()
             if should_force_sync:
@@ -274,52 +324,59 @@ class LLDBBridge:
             finally:
                 if should_force_sync:
                     self.debugger.SetAsync(orig_async)
+        finally:
+            self.exec_lock.release()
             
     def _cmd_get_status(self) -> Dict[str, Any]:
-        """获取结构化的调试状态"""
+        """
+        获取结构化的调试状态（只读操作，不持有 exec_lock）
+        
+        LLDB SB API 的读操作（GetState/GetProcess/GetThread 等）是线程安全的，
+        不需要 exec_lock 保护。去掉锁后，status 可在步骤命令执行期间并发查询。
+        """
         logger.info("get_status: 获取调试状态")
-        with self.exec_lock:
-            target = self.debugger.GetSelectedTarget()
-            if not target.IsValid():
-                logger.warning("get_status: 没有调试目标")
-                return {'has_target': False, 'message': '没有调试目标'}
-                
-            process = target.GetProcess()
-            if not process.IsValid():
-                logger.warning("get_status: 进程无效")
-                return {
-                    'has_target': True, 'has_process': False,
-                    'target': target.GetExecutable().GetFilename() or 'unknown'
-                }
-                
-            state = process.GetState()
-            state_map = {
-                lldb.eStateInvalid: "invalid", lldb.eStateUnloaded: "unloaded",
-                lldb.eStateConnected: "connected", lldb.eStateAttaching: "attaching",
-                lldb.eStateLaunching: "launching", lldb.eStateStopped: "stopped",
-                lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
-                lldb.eStateCrashed: "crashed", lldb.eStateDetached: "detached",
-                lldb.eStateExited: "exited", lldb.eStateSuspended: "suspended"
+        # 只读操作不需要 exec_lock，LLDB SB API 的读操作是线程安全的
+        target = self.debugger.GetSelectedTarget()
+        if not target.IsValid():
+            logger.warning("get_status: 没有调试目标")
+            return {'has_target': False, 'message': '没有调试目标'}
+            
+        process = target.GetProcess()
+        if not process.IsValid():
+            logger.warning("get_status: 进程无效")
+            return {
+                'has_target': True, 'has_process': False,
+                'target': target.GetExecutable().GetFilename() or 'unknown'
             }
             
-            info = {
-                'has_target': True, 'has_process': True,
-                'target': target.GetExecutable().GetFilename() or 'unknown',
-                'pid': process.GetProcessID(),
-                'state': state_map.get(state, str(state)),
-                'num_threads': process.GetNumThreads()
-            }
-            
-            if state == lldb.eStateStopped:
-                thread = process.GetSelectedThread()
-                if thread.IsValid():
-                    frame = thread.GetSelectedFrame()
-                    info['thread_id'] = thread.GetThreadID()
-                    if frame.IsValid():
-                        info['frame'] = str(frame)
-            
-            logger.info(f"get_status: state={info.get('state')}, pid={info.get('pid')}")
-            return info
+        state = process.GetState()
+        state_map = {
+            lldb.eStateInvalid: "invalid", lldb.eStateUnloaded: "unloaded",
+            lldb.eStateConnected: "connected", lldb.eStateAttaching: "attaching",
+            lldb.eStateLaunching: "launching", lldb.eStateStopped: "stopped",
+            lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
+            lldb.eStateCrashed: "crashed", lldb.eStateDetached: "detached",
+            lldb.eStateExited: "exited", lldb.eStateSuspended: "suspended"
+        }
+        
+        info = {
+            'has_target': True, 'has_process': True,
+            'target': target.GetExecutable().GetFilename() or 'unknown',
+            'pid': process.GetProcessID(),
+            'state': state_map.get(state, str(state)),
+            'num_threads': process.GetNumThreads()
+        }
+        
+        if state == lldb.eStateStopped:
+            thread = process.GetSelectedThread()
+            if thread.IsValid():
+                frame = thread.GetSelectedFrame()
+                info['thread_id'] = thread.GetThreadID()
+                if frame.IsValid():
+                    info['frame'] = str(frame)
+        
+        logger.info(f"get_status: state={info.get('state')}, pid={info.get('pid')}")
+        return info
             
     def _cmd_continue_async(self) -> Dict[str, Any]:
         """继续执行（异步，立即返回不阻塞）"""
@@ -351,45 +408,126 @@ class LLDBBridge:
                 self.debugger.GetCommandInterpreter().HandleCommand('process continue', cmd_result)
                 
                 state_after = process.GetState()
-                logger.info(f"continue_async: HandleCommand('process continue') succeeded={cmd_result.Succeeded()}, 状态={state_after}")
+                state_map = {
+                    lldb.eStateInvalid: "invalid", lldb.eStateStopped: "stopped",
+                    lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
+                    lldb.eStateCrashed: "crashed", lldb.eStateExited: "exited",
+                }
+                state_str = state_map.get(state_after, str(state_after))
+                logger.info(f"continue_async: HandleCommand('process continue') succeeded={cmd_result.Succeeded()}, 状态={state_after}({state_str})")
                 
-                if cmd_result.Succeeded():
-                    self._process_continued = True
-                    return {'success': True, 'message': '进程已继续执行', 'state': state_after}
+                if not cmd_result.Succeeded():
+                    error_msg = cmd_result.GetError() or '继续执行失败'
+                    logger.error(f"continue_async: 失败: {error_msg}")
+                    return {'success': False, 'error': error_msg}
                 
-                error_msg = cmd_result.GetError() or '继续执行失败'
-                logger.error(f"continue_async: 失败: {error_msg}")
-                return {'success': False, 'error': error_msg}
+                # 关键校验: HandleCommand 返回成功不代表进程真的 resume 了
+                # LLDB 有时 "process continue" 返回 Succeeded 但进程实际仍处于 stopped（如 auto-continue 回调失败）
+                if state_after == lldb.eStateStopped:
+                    logger.warning(f"continue_async: HandleCommand 成功但进程仍为 stopped，可能未真正 resume")
+                    self._process_continued = False
+                    # 尝试获取停止原因，帮助调用方诊断
+                    thread = process.GetSelectedThread()
+                    stop_desc = thread.GetStopDescription(256) if thread and thread.IsValid() else ""
+                    return {
+                        'success': False, 'did_not_resume': True,
+                        'error': '进程未恢复运行，仍处于 stopped 状态',
+                        'state': state_str, 'stop_description': stop_desc
+                    }
+                
+                # 进程确实进入了 running/stepping 状态
+                self._process_continued = True
+                return {'success': True, 'message': '进程已继续执行', 'state': state_str}
             except Exception as e:
                 logger.error(f"continue_async: 异常: {e}", exc_info=True)
                 return {'success': False, 'error': str(e)}
-            
-    def _cmd_stop_process(self) -> Dict[str, Any]:
-        """暂停进程"""
-        logger.info("stop_process: 尝试暂停进程")
+    
+    def _cmd_step_async(self, action: str) -> Dict[str, Any]:
+        """
+        执行单步命令（异步，立即返回不阻塞）
+        
+        与 continue_async 同理：SetAsync(True) 让 HandleCommand 立即返回，
+        调用方用 wait_for_stop 等待步骤完成。
+        这样 exec_lock 在步骤执行期间不会被持有，其他命令（stop/status）可并发执行。
+        """
+        logger.info(f"step_async: 执行步骤 '{action}'")
+        
+        # 统一映射：用户侧名称 → lldb 命令
+        action_map = {
+            "next": "next", "n": "next",
+            "step": "step", "s": "step",
+            "finish": "finish",
+            "nexti": "nexti", "ni": "nexti",
+            "stepi": "stepi", "si": "stepi",
+        }
+        lldb_cmd = action_map.get(action.lower())
+        if not lldb_cmd:
+            return {'success': False, 'error': f'无效动作: {action}。可选: next, step, finish, nexti, stepi'}
+        
         with self.exec_lock:
             target = self.debugger.GetSelectedTarget()
             if not target.IsValid():
-                logger.error("stop_process: 没有调试目标")
+                logger.error("step_async: 没有调试目标")
                 return {'success': False, 'error': '没有调试目标'}
             process = target.GetProcess()
             if not process.IsValid():
-                logger.error("stop_process: 进程无效")
+                logger.error("step_async: 进程无效")
                 return {'success': False, 'error': '进程无效'}
             
             state_before = process.GetState()
-            logger.info(f"stop_process: 执行前状态={state_before}")
+            logger.info(f"step_async: 执行前状态={state_before}, action={action}")
             
-            error = process.Stop()
-            state_after = process.GetState()
-            logger.info(f"stop_process: Stop() 返回 error.Success()={error.Success()}, 状态={state_after}")
+            # 关键：必须设为异步模式，否则 HandleCommand 会阻塞等待步骤完成
+            self.debugger.SetAsync(True)
             
-            if error.Success():
-                # 恢复同步模式，标记进程已停止
-                self._process_continued = False
-                self.debugger.SetAsync(False)
-                return {'success': True, 'message': '进程已暂停'}
-            return {'success': False, 'error': str(error)}
+            try:
+                cmd_result = lldb.SBCommandReturnObject()
+                self.debugger.GetCommandInterpreter().HandleCommand(lldb_cmd, cmd_result)
+                
+                if cmd_result.Succeeded():
+                    self._process_continued = True
+                    logger.info(f"step_async: 步骤 '{action}' 已发出")
+                    return {'success': True, 'action': action, 'message': f'步骤 {action} 已执行，请用 wait_for_stop 等待完成'}
+                
+                error_msg = cmd_result.GetError() or f'步骤执行失败: {lldb_cmd}'
+                logger.error(f"step_async: 失败: {error_msg}")
+                return {'success': False, 'error': error_msg}
+            except Exception as e:
+                logger.error(f"step_async: 异常: {e}", exc_info=True)
+                return {'success': False, 'error': str(e)}
+            
+    def _cmd_stop_process(self) -> Dict[str, Any]:
+        """
+        暂停进程（不持有 exec_lock，允许中断正在执行的命令）
+        
+        关键设计：process.Stop() 是安全的并发操作，不需要 exec_lock。
+        这样即使 step_async/execute 正在执行（持有 exec_lock），
+        stop_process 仍可通过新连接并发送达并执行，实现可抢占的 process interrupt。
+        """
+        logger.info("stop_process: 尝试暂停进程")
+        # 不使用 exec_lock，允许在另一个命令执行期间中断进程
+        target = self.debugger.GetSelectedTarget()
+        if not target.IsValid():
+            logger.error("stop_process: 没有调试目标")
+            return {'success': False, 'error': '没有调试目标'}
+        process = target.GetProcess()
+        if not process.IsValid():
+            logger.error("stop_process: 进程无效")
+            return {'success': False, 'error': '进程无效'}
+        
+        state_before = process.GetState()
+        logger.info(f"stop_process: 执行前状态={state_before}")
+        
+        error = process.Stop()
+        state_after = process.GetState()
+        logger.info(f"stop_process: Stop() 返回 error.Success()={error.Success()}, 状态={state_after}")
+        
+        if error.Success():
+            # 恢复同步模式，标记进程已停止
+            self._process_continued = False
+            self.debugger.SetAsync(False)
+            return {'success': True, 'message': '进程已暂停'}
+        return {'success': False, 'error': str(error)}
                 
     def _cmd_wait_for_stop(self, timeout: float = 30.0) -> Dict[str, Any]:
         """等待进程停止（不持有 exec_lock，允许并发 stop）"""
@@ -409,13 +547,36 @@ class LLDBBridge:
         listener = lldb.SBListener("wait_for_stop_listener")
         process.GetBroadcaster().AddListener(listener, lldb.SBProcess.eBroadcastBitStateChanged)
         
+        # 完整的 stop reason 映射（覆盖所有 LLDB eStopReason 枚举值）
         reason_map = {
+            lldb.eStopReasonNone: "none",
+            lldb.eStopReasonTrace: "trace",
             lldb.eStopReasonBreakpoint: "breakpoint",
             lldb.eStopReasonWatchpoint: "watchpoint",
             lldb.eStopReasonSignal: "signal",
             lldb.eStopReasonException: "exception",
-            lldb.eStopReasonTrace: "trace",
             lldb.eStopReasonPlanComplete: "step_complete",
+            lldb.eStopReasonThreadShouldExit: "thread_exit",
+            lldb.eStopReasonInstrumentation: "instrumentation",
+        }
+        # LLDB 版本差异可能缺少某些枚举，安全获取
+        for name, val in [
+            ("eStopReasonProcessorTrace", "processor_trace"),
+            ("eStopReasonFork", "fork"),
+            ("eStopReasonVFork", "vfork"),
+            ("eStopReasonVForkDone", "vfork_done"),
+        ]:
+            if hasattr(lldb, name):
+                reason_map[getattr(lldb, name)] = val
+        
+        # 进程状态映射（用于结构化返回）
+        state_map = {
+            lldb.eStateInvalid: "invalid", lldb.eStateUnloaded: "unloaded",
+            lldb.eStateConnected: "connected", lldb.eStateAttaching: "attaching",
+            lldb.eStateLaunching: "launching", lldb.eStateStopped: "stopped",
+            lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
+            lldb.eStateCrashed: "crashed", lldb.eStateDetached: "detached",
+            lldb.eStateExited: "exited", lldb.eStateSuspended: "suspended"
         }
         
         start = time.time()
@@ -459,12 +620,28 @@ class LLDBBridge:
                         mod_name = module.GetFileSpec().GetFilename() if module.IsValid() else "unknown"
                         frame_info = f"pc=0x{pc:x}, func={func}, module={mod_name}"
                 
-                # 构建基本返回结果
+                # 构建基本返回结果（强制包含结构化字段）
+                # reason 映射：未知值用 "unknown_N" 格式，避免返回裸数字如 "1"
+                reason_str = reason_map.get(reason, f"unknown_{reason}")
+                
+                # 提取结构化字段
+                thread_id = None
+                pc = None
+                if thread.IsValid():
+                    thread_id = thread.GetThreadID()
+                    frame = thread.GetSelectedFrame()
+                    if frame.IsValid():
+                        pc = frame.GetPC()
+                
                 result = {
                     'stopped': True,
-                    'reason': reason_map.get(reason, str(reason)),
+                    'reason': reason_str,
                     'stop_description': stop_description,
-                    'frame_info': frame_info
+                    'frame_info': frame_info,
+                    # 强制结构化字段（确保 AI 端总能拿到，无需从 frame_info 解析）
+                    'thread_id': thread_id,
+                    'pc': f"0x{pc:x}" if pc is not None else None,
+                    'process_state': state_map.get(state, str(state)),
                 }
                 
                 # 针对断点停止，进一步区分条件断点的情况
@@ -478,7 +655,11 @@ class LLDBBridge:
                 self._process_continued = False
                 self.debugger.SetAsync(False)
                 logger.info(f"wait_for_stop: 进程已结束, state={state}")
-                return {'stopped': True, 'reason': 'process_ended'}
+                return {
+                    'stopped': True,
+                    'reason': 'process_ended',
+                    'process_state': state_map.get(state, str(state)),
+                }
             
             # 等待事件（比轮询更可靠）
             event = lldb.SBEvent()
