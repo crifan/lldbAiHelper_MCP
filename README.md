@@ -28,6 +28,8 @@ LLDB `MCP` (Model Context Protocol) Bridge + Server, enabling AI assistants (Qod
 - **File Logging**: Both MCP Server and Bridge write detailed logs to `logs/YYYYMMDD/` for debugging and troubleshooting
 - **Bridge Disconnect Diagnostics**: When Bridge connection fails, MCP Server automatically collects port file status and recent Bridge log tail for diagnosis; Bridge records process state on exit
 - **Structured Stop Reason**: `wait_for_stop` returns stable string reason (never raw enum numbers), always includes `thread_id`, `pc`, `process_state` as structured fields
+- **LLDB Version Safe**: All LLDB enum references use `getattr()` runtime lookup, no `AttributeError` crashes across different LLDB versions
+- **Halt Timeout Diagnostics**: `lldb_stop` returns process diagnostics (pid, state, thread count, target alive) when halt fails, helping diagnose stale process or debugserver issues
 - **Auto Confirm**: Bridge auto-sets `auto-confirm true` so AI-driven operations (e.g., `breakpoint delete`) won't block on user prompts
 - **Batch Operations**: Register read supports comma-separated batch (e.g., `"x0,x1,sp,pc"`); dedicated batch tools for memory read, breakpoint set/delete reduce MCP round-trips
 - **Full Toolset**: 21 MCP tools covering execution control, memory, registers, breakpoints, disassembly, flow control, ObjC analysis, and batch operations
@@ -226,3 +228,11 @@ Available commands inside LLDB after loading the Bridge:
 - `_cmd_execute` only forces `SetAsync(False)` when process is NOT running, preventing async mode interference while process is in flight
 - `wait_for_stop` restores `SetAsync(False)` when process stops, ensuring subsequent commands work in sync mode
 - Auto-continue breakpoints cause transient stopped states; `wait_for_stop` waits 50ms to confirm process truly stopped before reporting
+
+### LLDB Version Compatibility
+
+- Different LLDB versions (Xcode bundled vs Homebrew vs Linux) have different enum sets — e.g., `eStopReasonThreadShouldExit` may not exist
+- All enum references use `getattr(lldb, attr, None)` runtime lookup instead of direct `lldb.xxx` access
+- `_build_stop_reason_map()` / `_build_state_map()` build enum maps at runtime, skipping missing entries, cached at class level
+- Unknown enum values fallback to `"unknown_N"` format instead of crashing with `AttributeError`
+- Frequently used enum values are pre-fetched as local constants (e.g., `STATE_STOPPED = getattr(lldb, 'eStateStopped', 6)`) for comparison
