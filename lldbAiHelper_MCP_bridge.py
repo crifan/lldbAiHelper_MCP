@@ -69,6 +69,69 @@ class LLDBBridge:
     LLDB Bridge - Socket Server (短连接 + 并发线程)
     """
     
+    # LLDB enum 映射表（类级别，只构建一次）
+    # 使用 getattr 安全获取，不同 LLDB 版本可能缺少某些枚举
+    _STOP_REASON_MAP = None
+    _STATE_MAP = None
+    
+    @classmethod
+    def _build_stop_reason_map(cls) -> Dict[int, str]:
+        """运行时安全构建 stop reason 映射，getattr 避免 AttributeError"""
+        if cls._STOP_REASON_MAP is not None:
+            return cls._STOP_REASON_MAP
+        entries = [
+            ("eStopReasonInvalid", "invalid"),
+            ("eStopReasonNone", "none"),
+            ("eStopReasonTrace", "trace"),
+            ("eStopReasonBreakpoint", "breakpoint"),
+            ("eStopReasonWatchpoint", "watchpoint"),
+            ("eStopReasonSignal", "signal"),
+            ("eStopReasonException", "exception"),
+            ("eStopReasonExec", "exec"),
+            ("eStopReasonPlanComplete", "plan_complete"),
+            ("eStopReasonThreadExiting", "thread_exiting"),
+            ("eStopReasonThreadShouldExit", "thread_exit"),
+            ("eStopReasonInstrumentation", "instrumentation"),
+            ("eStopReasonProcessorTrace", "processor_trace"),
+            ("eStopReasonFork", "fork"),
+            ("eStopReasonVFork", "vfork"),
+            ("eStopReasonVForkDone", "vfork_done"),
+        ]
+        result = {}
+        for attr, label in entries:
+            value = getattr(lldb, attr, None)
+            if value is not None:
+                result[value] = label
+        cls._STOP_REASON_MAP = result
+        return result
+    
+    @classmethod
+    def _build_state_map(cls) -> Dict[int, str]:
+        """运行时安全构建 process state 映射，getattr 避免 AttributeError"""
+        if cls._STATE_MAP is not None:
+            return cls._STATE_MAP
+        entries = [
+            ("eStateInvalid", "invalid"),
+            ("eStateUnloaded", "unloaded"),
+            ("eStateConnected", "connected"),
+            ("eStateAttaching", "attaching"),
+            ("eStateLaunching", "launching"),
+            ("eStateStopped", "stopped"),
+            ("eStateRunning", "running"),
+            ("eStateStepping", "stepping"),
+            ("eStateCrashed", "crashed"),
+            ("eStateDetached", "detached"),
+            ("eStateExited", "exited"),
+            ("eStateSuspended", "suspended"),
+        ]
+        result = {}
+        for attr, label in entries:
+            value = getattr(lldb, attr, None)
+            if value is not None:
+                result[value] = label
+        cls._STATE_MAP = result
+        return result
+    
     def __init__(self, debugger, host: str = DEFAULT_HOST):
         self.debugger = debugger
         self.host = host
@@ -137,7 +200,7 @@ class LLDBBridge:
                         state = process.GetState()
                         pid = process.GetProcessID()
                         diag_parts.append(f"pid={pid}, state={state}")
-                        if state == lldb.eStateStopped:
+                        if state == getattr(lldb, 'eStateStopped', 6):
                             thread = process.GetSelectedThread()
                             if thread and thread.IsValid():
                                 pc = thread.GetSelectedFrame().GetPC() if thread.GetSelectedFrame().IsValid() else 0
@@ -350,14 +413,7 @@ class LLDBBridge:
             }
             
         state = process.GetState()
-        state_map = {
-            lldb.eStateInvalid: "invalid", lldb.eStateUnloaded: "unloaded",
-            lldb.eStateConnected: "connected", lldb.eStateAttaching: "attaching",
-            lldb.eStateLaunching: "launching", lldb.eStateStopped: "stopped",
-            lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
-            lldb.eStateCrashed: "crashed", lldb.eStateDetached: "detached",
-            lldb.eStateExited: "exited", lldb.eStateSuspended: "suspended"
-        }
+        state_map = self._build_state_map()
         
         info = {
             'has_target': True, 'has_process': True,
@@ -367,7 +423,7 @@ class LLDBBridge:
             'num_threads': process.GetNumThreads()
         }
         
-        if state == lldb.eStateStopped:
+        if state == getattr(lldb, 'eStateStopped', 6):
             thread = process.GetSelectedThread()
             if thread.IsValid():
                 frame = thread.GetSelectedFrame()
@@ -408,11 +464,7 @@ class LLDBBridge:
                 self.debugger.GetCommandInterpreter().HandleCommand('process continue', cmd_result)
                 
                 state_after = process.GetState()
-                state_map = {
-                    lldb.eStateInvalid: "invalid", lldb.eStateStopped: "stopped",
-                    lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
-                    lldb.eStateCrashed: "crashed", lldb.eStateExited: "exited",
-                }
+                state_map = self._build_state_map()
                 state_str = state_map.get(state_after, str(state_after))
                 logger.info(f"continue_async: HandleCommand('process continue') succeeded={cmd_result.Succeeded()}, 状态={state_after}({state_str})")
                 
@@ -423,7 +475,7 @@ class LLDBBridge:
                 
                 # 关键校验: HandleCommand 返回成功不代表进程真的 resume 了
                 # LLDB 有时 "process continue" 返回 Succeeded 但进程实际仍处于 stopped（如 auto-continue 回调失败）
-                if state_after == lldb.eStateStopped:
+                if state_after == getattr(lldb, 'eStateStopped', 6):
                     logger.warning(f"continue_async: HandleCommand 成功但进程仍为 stopped，可能未真正 resume")
                     self._process_continued = False
                     # 尝试获取停止原因，帮助调用方诊断
@@ -527,7 +579,25 @@ class LLDBBridge:
             self._process_continued = False
             self.debugger.SetAsync(False)
             return {'success': True, 'message': '进程已暂停'}
-        return {'success': False, 'error': str(error)}
+        
+        # halt 失败（如 "Halt timed out"），附带进程诊断帮助判断原因
+        state_map = self._build_state_map()
+        diag = {
+            'pid': process.GetProcessID(),
+            'state': state_map.get(state_after, str(state_after)),
+            'num_threads': process.GetNumThreads(),
+        }
+        # 检查 target 是否还活着
+        target_alive = target.IsValid()
+        diag['target_alive'] = target_alive
+        
+        logger.warning(f"stop_process: Stop() 失败: {error}, 诊断: {diag}")
+        return {
+            'success': False,
+            'error': str(error),
+            'diagnostics': diag,
+            'hint': 'Halt timed out 可能原因: stale process (已退出但状态未刷新)、remote debugserver 卡死、调试服务状态不一致',
+        }
                 
     def _cmd_wait_for_stop(self, timeout: float = 30.0) -> Dict[str, Any]:
         """等待进程停止（不持有 exec_lock，允许并发 stop）"""
@@ -547,37 +617,17 @@ class LLDBBridge:
         listener = lldb.SBListener("wait_for_stop_listener")
         process.GetBroadcaster().AddListener(listener, lldb.SBProcess.eBroadcastBitStateChanged)
         
-        # 完整的 stop reason 映射（覆盖所有 LLDB eStopReason 枚举值）
-        reason_map = {
-            lldb.eStopReasonNone: "none",
-            lldb.eStopReasonTrace: "trace",
-            lldb.eStopReasonBreakpoint: "breakpoint",
-            lldb.eStopReasonWatchpoint: "watchpoint",
-            lldb.eStopReasonSignal: "signal",
-            lldb.eStopReasonException: "exception",
-            lldb.eStopReasonPlanComplete: "step_complete",
-            lldb.eStopReasonThreadShouldExit: "thread_exit",
-            lldb.eStopReasonInstrumentation: "instrumentation",
-        }
-        # LLDB 版本差异可能缺少某些枚举，安全获取
-        for name, val in [
-            ("eStopReasonProcessorTrace", "processor_trace"),
-            ("eStopReasonFork", "fork"),
-            ("eStopReasonVFork", "vfork"),
-            ("eStopReasonVForkDone", "vfork_done"),
-        ]:
-            if hasattr(lldb, name):
-                reason_map[getattr(lldb, name)] = val
+        # 运行时安全构建映射（getattr 避免 AttributeError）
+        reason_map = self._build_stop_reason_map()
+        state_map = self._build_state_map()
         
-        # 进程状态映射（用于结构化返回）
-        state_map = {
-            lldb.eStateInvalid: "invalid", lldb.eStateUnloaded: "unloaded",
-            lldb.eStateConnected: "connected", lldb.eStateAttaching: "attaching",
-            lldb.eStateLaunching: "launching", lldb.eStateStopped: "stopped",
-            lldb.eStateRunning: "running", lldb.eStateStepping: "stepping",
-            lldb.eStateCrashed: "crashed", lldb.eStateDetached: "detached",
-            lldb.eStateExited: "exited", lldb.eStateSuspended: "suspended"
-        }
+        # 预取常用枚举值（getattr 安全兜底）
+        STATE_STOPPED = getattr(lldb, 'eStateStopped', 6)
+        STATE_EXITED = getattr(lldb, 'eStateExited', 10)
+        STATE_CRASHED = getattr(lldb, 'eStateCrashed', 8)
+        STATE_DETACHED = getattr(lldb, 'eStateDetached', 9)
+        REASON_BREAKPOINT = getattr(lldb, 'eStopReasonBreakpoint', 2)
+        REASON_NONE = getattr(lldb, 'eStopReasonNone', 0)
         
         start = time.time()
         while time.time() - start < timeout:
@@ -585,13 +635,13 @@ class LLDBBridge:
             state = process.GetState()
             logger.debug(f"wait_for_stop: 当前状态={state}")
             
-            if state == lldb.eStateStopped:
+            if state == STATE_STOPPED:
                 # 关键修复: 等待一小段时间，确认不是 auto-continue 的瞬时停止
                 # auto-continue 断点或回调返回 False 会让进程瞬时停止后立即恢复运行
                 # 如果不做此检查，会误报为真正停止，后续命令与实际运行状态不一致（state desync）
                 time.sleep(0.05)  # 50ms 等待 auto-continue 生效
                 recheck_state = process.GetState()
-                if recheck_state != lldb.eStateStopped:
+                if recheck_state != STATE_STOPPED:
                     logger.info(f"wait_for_stop: 瞬时停止后恢复运行 (state={recheck_state}), 继续等待 (auto-continue)")
                     continue
                 
@@ -600,7 +650,7 @@ class LLDBBridge:
                 self.debugger.SetAsync(False)
                 
                 thread = process.GetSelectedThread()
-                reason = thread.GetStopReason() if thread.IsValid() else lldb.eStopReasonNone
+                reason = thread.GetStopReason() if thread.IsValid() else REASON_NONE
                 logger.info(f"wait_for_stop: 进程已停止, reason={reason}")
                 
                 # 获取详细停止描述（关键：包含条件表达式错误等信息）
@@ -645,13 +695,13 @@ class LLDBBridge:
                 }
                 
                 # 针对断点停止，进一步区分条件断点的情况
-                if reason == lldb.eStopReasonBreakpoint and thread.IsValid():
+                if reason == REASON_BREAKPOINT and thread.IsValid():
                     bp_detail = self._get_breakpoint_stop_detail(thread, target, stop_description)
                     result.update(bp_detail)
                 
                 logger.info(f"wait_for_stop: 返回 result={result}")
                 return result
-            elif state in [lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached]:
+            elif state in [STATE_EXITED, STATE_CRASHED, STATE_DETACHED]:
                 self._process_continued = False
                 self.debugger.SetAsync(False)
                 logger.info(f"wait_for_stop: 进程已结束, state={state}")
