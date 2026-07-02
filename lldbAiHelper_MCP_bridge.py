@@ -23,7 +23,9 @@ lldbAiHelper_MCP_bridge.py - LLDB Bridge (在 lldb 进程内运行)
 
 import json
 import os
+import re
 import socket
+import subprocess
 import threading
 import traceback
 import logging
@@ -73,7 +75,103 @@ class LLDBBridge:
     # 使用 getattr 安全获取，不同 LLDB 版本可能缺少某些枚举
     _STOP_REASON_MAP = None
     _STATE_MAP = None
-    
+    _ANDROID_PACKAGE_RE = re.compile(
+        r'^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+(?::[A-Za-z0-9_./-]+)?$'
+    )
+    _INVALID_PID_VALUES = frozenset({0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF})
+
+    # 会长时间阻塞 exec_lock 的 LLDB 命令（同步模式下 HandleCommand 会等进程停止才返回）
+    # 这些命令必须走专用的 lldb_continue / lldb_flow_control 异步路径，
+    # 否则会拖住后续所有 lldb_execute 调用。
+    _BLOCKING_SINGLE_ALIASES = frozenset({
+        # continue
+        'c', 'co', 'con', 'cont', 'conti', 'continu', 'continue',
+        # step (源码级 step-in)
+        's', 'st', 'ste', 'step',
+        # next (源码级 step-over)
+        'n', 'ne', 'nex', 'next',
+        # finish (step-out)
+        'fin', 'fini', 'finis', 'finish',
+        # nexti (汇编级 step-over)
+        'ni', 'nexti',
+        # stepi (汇编级 step-in)
+        'si', 'stepi',
+        # run / launch (仅启动进程时使用，正常不会出现在交互调试中)
+        'r', 'ru', 'run',
+    })
+
+    _BLOCKING_COMPOUND_PREFIXES = frozenset({
+        ('process', 'continue'),
+        ('process', 'launch'),
+        ('process', 'step-out'),
+        ('thread', 'continue'),
+        ('thread', 'step-in'),
+        ('thread', 'step-over'),
+        ('thread', 'step-out'),
+        ('thread', 'step-inst'),
+        ('thread', 'step-inst-over'),
+    })
+
+    _BLOCKING_HELP_HINT = (
+        "[错误: lldb_execute 拒绝执行长阻塞命令 '{matched}'。\n"
+        "原因: 此类命令会让 LLDB 同步等待进程停止，期间会一直持有 exec_lock，\n"
+        "导致后续所有 lldb_execute / lldb_flow_control / lldb_continue 调用被拒绝或超时。\n"
+        "请改用下列专用异步 MCP 工具:\n"
+        "  - continue (c) / process continue / thread continue\n"
+        "      → lldb_continue + lldb_wait_stop\n"
+        "  - step (s) / next (n) / nexti (ni) / stepi (si) / finish\n"
+        "      → lldb_flow_control(action=\"step\"/\"next\"/\"nexti\"/\"stepi\"/\"finish\") + lldb_wait_stop\n"
+        "  - run (r) / process launch\n"
+        "      → 一般在 LLDB 控制台手动启动，不走 MCP\n"
+        "如果当前 exec_lock 已被占用、lldb_execute 全部返回“另一个命令正在执行中”:\n"
+        "  请调用 lldb_stop 中断进程（lldb_stop / lldb_status 不依赖 exec_lock，可随时抢占）。]"
+    )
+
+    _INTERRUPT_SINGLE_ALIASES = frozenset({'interrupt', 'halt'})
+    _INTERRUPT_COMPOUND_PREFIXES = frozenset({
+        ('process', 'interrupt'),
+        ('process', 'halt'),
+    })
+
+    @classmethod
+    def _detect_blocking_command(cls, command: str) -> Optional[str]:
+        """
+        检测一条 LLDB 命令是否属于会长时间阻塞 exec_lock 的类型。
+        返回命中的命令名（用于错误提示），未命中返回 None。
+
+        仅凭首词 / 首+次词判断，不处理 “;” 多命令颗粒场景（LLDB 本身不支持）。
+        """
+        if not command:
+            return None
+        tokens = command.strip().split()
+        if not tokens:
+            return None
+        first = tokens[0].lower()
+        second = tokens[1].lower() if len(tokens) > 1 else None
+
+        if first in cls._BLOCKING_SINGLE_ALIASES:
+            return first
+        if second is not None and (first, second) in cls._BLOCKING_COMPOUND_PREFIXES:
+            return f"{first} {second}"
+        return None
+
+    @classmethod
+    def _detect_interrupt_command(cls, command: str) -> Optional[str]:
+        """识别会触发 process halt/interrupt 的命令，统一改走安全 stop_process 路径。"""
+        if not command:
+            return None
+        tokens = command.strip().split()
+        if not tokens:
+            return None
+        first = tokens[0].lower()
+        second = tokens[1].lower() if len(tokens) > 1 else None
+
+        if first in cls._INTERRUPT_SINGLE_ALIASES:
+            return first
+        if second is not None and (first, second) in cls._INTERRUPT_COMPOUND_PREFIXES:
+            return f"{first} {second}"
+        return None
+
     @classmethod
     def _build_stop_reason_map(cls) -> Dict[int, str]:
         """运行时安全构建 stop reason 映射，getattr 避免 AttributeError"""
@@ -131,6 +229,358 @@ class LLDBBridge:
                 result[value] = label
         cls._STATE_MAP = result
         return result
+
+    @classmethod
+    def _state_label(cls, state: int) -> str:
+        return cls._build_state_map().get(state, str(state))
+
+    @classmethod
+    def _is_process_ended_state(cls, state: int) -> bool:
+        ended_states = {
+            getattr(lldb, 'eStateExited', 10),
+            getattr(lldb, 'eStateCrashed', 8),
+            getattr(lldb, 'eStateDetached', 9),
+            getattr(lldb, 'eStateInvalid', 0),
+            getattr(lldb, 'eStateUnloaded', 1),
+        }
+        return state in ended_states
+
+    @classmethod
+    def _is_android_package_candidate(cls, value: str) -> bool:
+        if not value:
+            return False
+        value = value.strip()
+        if value in {'unknown', '<unknown>'}:
+            return False
+        if '/' in value or value.endswith('.so'):
+            return False
+        return bool(cls._ANDROID_PACKAGE_RE.match(value))
+
+    @staticmethod
+    def _safe_get_filename(filespec) -> Optional[str]:
+        try:
+            if filespec and filespec.IsValid():
+                return filespec.GetFilename()
+        except Exception:
+            pass
+        return None
+
+    def _infer_android_package_name(self, target, process) -> Optional[str]:
+        """尽力从 LLDB target/process 元数据推断 Android 包名，失败时返回 None。"""
+        candidates = []
+
+        try:
+            process_info = process.GetProcessInfo()
+            if process_info:
+                for method_name in ('GetName', 'GetExecutableFile'):
+                    try:
+                        value = getattr(process_info, method_name)()
+                        if method_name == 'GetExecutableFile':
+                            value = self._safe_get_filename(value)
+                        if value:
+                            candidates.append(str(value))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            executable = target.GetExecutable()
+            filename = self._safe_get_filename(executable)
+            if filename:
+                candidates.append(filename)
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            if self._is_android_package_candidate(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _safe_platform_name(target) -> Optional[str]:
+        try:
+            platform = target.GetPlatform()
+            if platform and platform.IsValid():
+                return platform.GetName()
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _safe_target_name(target) -> str:
+        try:
+            executable = target.GetExecutable()
+            if executable and executable.IsValid():
+                return executable.GetFilename() or 'unknown'
+        except Exception:
+            pass
+        return 'unknown'
+
+    def _get_adb_pid_for_package(self, package_name: str, adb_serial: str = "", timeout: float = 2.0) -> Dict[str, Any]:
+        """通过 adb pidof 查询 Android 当前进程 PID。失败时返回 checked=False，不阻断 LLDB 操作。"""
+        package_name = (package_name or "").strip()
+        if not package_name:
+            return {'checked': False, 'error': '未提供 Android package_name'}
+
+        adb_path = os.environ.get('ADB', 'adb')
+        command = [adb_path]
+        adb_serial = (adb_serial or os.environ.get('ANDROID_SERIAL') or "").strip()
+        if adb_serial:
+            command.extend(['-s', adb_serial])
+        command.extend(['shell', 'pidof', package_name])
+
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError:
+            return {
+                'checked': False,
+                'package_name': package_name,
+                'adb_serial': adb_serial or None,
+                'error': f'adb 不存在: {adb_path}',
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                'checked': False,
+                'package_name': package_name,
+                'adb_serial': adb_serial or None,
+                'error': f'adb pidof 超时 ({timeout}s)',
+            }
+        except Exception as e:
+            return {
+                'checked': False,
+                'package_name': package_name,
+                'adb_serial': adb_serial or None,
+                'error': f'adb pidof 异常: {e}',
+            }
+
+        stdout = (completed.stdout or '').strip()
+        stderr = (completed.stderr or '').strip()
+        pids = []
+        for token in stdout.replace(',', ' ').split():
+            try:
+                pids.append(int(token))
+            except ValueError:
+                pass
+
+        return {
+            'checked': True,
+            'package_name': package_name,
+            'adb_serial': adb_serial or None,
+            'returncode': completed.returncode,
+            'stdout': stdout,
+            'stderr': stderr,
+            'pid': pids[0] if pids else None,
+            'pids': pids,
+        }
+
+    def _get_adb_process_for_pid(self, pid: int, adb_serial: str = "", timeout: float = 2.0) -> Dict[str, Any]:
+        """不依赖包名，仅检查 LLDB PID 在 Android 设备上是否还存在。"""
+        if pid in self._INVALID_PID_VALUES:
+            return {'checked': False, 'pid': pid, 'error': '无效 PID'}
+
+        adb_path = os.environ.get('ADB', 'adb')
+        adb_serial = (adb_serial or os.environ.get('ANDROID_SERIAL') or "").strip()
+        base_command = [adb_path]
+        if adb_serial:
+            base_command.extend(['-s', adb_serial])
+
+        last_error = None
+        for ps_args in (['shell', 'ps', '-A'], ['shell', 'ps']):
+            command = base_command + ps_args
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return {
+                    'checked': False,
+                    'pid': pid,
+                    'adb_serial': adb_serial or None,
+                    'error': f'adb 不存在: {adb_path}',
+                }
+            except subprocess.TimeoutExpired:
+                last_error = f"adb {' '.join(ps_args)} 超时 ({timeout}s)"
+                continue
+            except Exception as e:
+                last_error = f"adb {' '.join(ps_args)} 异常: {e}"
+                continue
+
+            stdout = completed.stdout or ''
+            stderr = (completed.stderr or '').strip()
+            if completed.returncode != 0 and not stdout.strip():
+                last_error = stderr or f"adb {' '.join(ps_args)} returncode={completed.returncode}"
+                continue
+
+            pid_str = str(pid)
+            for line in stdout.splitlines():
+                tokens = line.split()
+                if not tokens:
+                    continue
+                if pid_str in tokens[:4]:
+                    return {
+                        'checked': True,
+                        'pid': pid,
+                        'pid_exists': True,
+                        'process_name': tokens[-1] if tokens else None,
+                        'process_line': line.strip(),
+                        'adb_serial': adb_serial or None,
+                    }
+
+            return {
+                'checked': True,
+                'pid': pid,
+                'pid_exists': False,
+                'adb_serial': adb_serial or None,
+                'stderr': stderr,
+            }
+
+        return {
+            'checked': False,
+            'pid': pid,
+            'adb_serial': adb_serial or None,
+            'error': last_error or 'adb ps 失败',
+        }
+
+    def _collect_process_diagnostics(
+        self,
+        target,
+        process,
+        package_name: str = "",
+        adb_serial: str = "",
+        include_adb: bool = True,
+    ) -> Dict[str, Any]:
+        """收集 halt/interrupt 前后的 LLDB + ADB 诊断信息。"""
+        state = process.GetState()
+        lldb_pid = process.GetProcessID()
+        explicit_package = (package_name or "").strip()
+        resolved_package = explicit_package or self._infer_android_package_name(target, process)
+        platform_name = self._safe_platform_name(target)
+        should_check_adb = (
+            include_adb
+            and lldb_pid not in self._INVALID_PID_VALUES
+            and not self._is_process_ended_state(state)
+        )
+
+        diag = {
+            'target_alive': target.IsValid(),
+            'process_valid': process.IsValid(),
+            'target': self._safe_target_name(target),
+            'platform': platform_name,
+            'lldb_pid': lldb_pid,
+            'pid': lldb_pid,
+            'state': self._state_label(state),
+            'state_value': state,
+            'num_threads': process.GetNumThreads(),
+            'package_name': resolved_package,
+            'package_name_source': 'explicit' if explicit_package else ('inferred' if resolved_package else None),
+        }
+
+        if should_check_adb and resolved_package:
+            adb_diag = self._get_adb_pid_for_package(resolved_package, adb_serial=adb_serial)
+            diag['adb_checked'] = adb_diag.get('checked', False)
+            diag['adb_pid'] = adb_diag.get('pid')
+            diag['adb_current_pid'] = adb_diag.get('pid')
+            diag['adb_pids'] = adb_diag.get('pids', [])
+            diag['adb_serial'] = adb_diag.get('adb_serial')
+            diag['adb_error'] = adb_diag.get('error')
+            diag['adb_returncode'] = adb_diag.get('returncode')
+            diag['adb_stdout'] = adb_diag.get('stdout')
+            diag['adb_stderr'] = adb_diag.get('stderr')
+        else:
+            diag['adb_checked'] = False
+            diag['adb_pid'] = None
+            diag['adb_current_pid'] = None
+            diag['adb_pids'] = []
+            diag['adb_serial'] = (adb_serial or os.environ.get('ANDROID_SERIAL') or "").strip() or None
+            diag['adb_error'] = '未提供或无法推断 Android package_name'
+
+        diag['adb_lldb_pid_checked'] = False
+        diag['adb_lldb_pid_alive'] = None
+        if should_check_adb and not resolved_package and platform_name and 'android' in platform_name.lower():
+            pid_diag = self._get_adb_process_for_pid(lldb_pid, adb_serial=adb_serial)
+            diag['adb_lldb_pid_checked'] = pid_diag.get('checked', False)
+            diag['adb_lldb_pid_alive'] = pid_diag.get('pid_exists')
+            diag['adb_lldb_process_name'] = pid_diag.get('process_name')
+            diag['adb_lldb_process_line'] = pid_diag.get('process_line')
+            diag['adb_lldb_pid_error'] = pid_diag.get('error')
+
+        return diag
+
+    def _interrupt_failure_payload(self, reason: str, diagnostics: Dict[str, Any], error: str) -> Dict[str, Any]:
+        return {
+            'success': False,
+            'reason': reason,
+            'error': error,
+            'lldb_pid': diagnostics.get('lldb_pid'),
+            'adb_pid': diagnostics.get('adb_pid'),
+            'adb_current_pid': diagnostics.get('adb_current_pid'),
+            'state': diagnostics.get('state'),
+            'diagnostics': diagnostics,
+        }
+
+    def _preflight_interrupt(self, target, process, package_name: str = "", adb_serial: str = "") -> Optional[Dict[str, Any]]:
+        """
+        halt/interrupt 前检查 target 是否已经结束或指向旧 PID。
+        返回 None 表示未发现 stale/ended，可以继续调用 process.Stop()。
+        """
+        diagnostics = self._collect_process_diagnostics(
+            target,
+            process,
+            package_name=package_name,
+            adb_serial=adb_serial,
+            include_adb=True,
+        )
+        lldb_pid = diagnostics.get('lldb_pid')
+        adb_pid = diagnostics.get('adb_pid')
+        adb_pids = diagnostics.get('adb_pids') or []
+        state_value = diagnostics.get('state_value')
+
+        if lldb_pid in self._INVALID_PID_VALUES or self._is_process_ended_state(state_value):
+            logger.warning(f"interrupt preflight: process_ended, diagnostics={diagnostics}")
+            return self._interrupt_failure_payload(
+                'process_ended',
+                diagnostics,
+                'LLDB target process 已结束或无有效 PID，请重新 attach 当前进程',
+            )
+
+        if diagnostics.get('adb_checked'):
+            if adb_pid is None:
+                logger.warning(f"interrupt preflight: ADB 未找到进程, diagnostics={diagnostics}")
+                return self._interrupt_failure_payload(
+                    'process_ended',
+                    diagnostics,
+                    'ADB 当前未找到该 package 的进程，请重新启动/attach',
+                )
+            if lldb_pid not in adb_pids:
+                logger.warning(f"interrupt preflight: stale_target, diagnostics={diagnostics}")
+                return self._interrupt_failure_payload(
+                    'stale_target',
+                    diagnostics,
+                    'LLDB target PID 与 ADB 当前 PID 不一致，请重新 attach 新进程',
+                )
+
+        if diagnostics.get('adb_lldb_pid_checked') and diagnostics.get('adb_lldb_pid_alive') is False:
+            logger.warning(f"interrupt preflight: ADB 上已找不到 LLDB PID, diagnostics={diagnostics}")
+            return self._interrupt_failure_payload(
+                'process_ended',
+                diagnostics,
+                'ADB 当前已找不到 LLDB target PID，请重新 attach 当前进程',
+            )
+
+        return None
     
     def __init__(self, debugger, host: str = DEFAULT_HOST):
         self.debugger = debugger
@@ -323,13 +773,27 @@ class LLDBBridge:
         logger.debug("ping: pong")
         return "pong"
         
-    def _cmd_execute(self, command: str) -> str:
-        """执行 lldb 命令（串行化 + 智能 async 管理 + 超时保护）"""
+    def _cmd_execute(self, command: str, package_name: str = "", adb_serial: str = "") -> Any:
+        """执行 lldb 命令（串行化 + 智能 async 管理 + 超时保护 + 长阻塞命令拦截）"""
         logger.info(f"execute: 执行命令 '{command}'")
+
+        # process interrupt/halt 也可能卡在 Halt timed out；统一走带 stale-target
+        # 预检的 stop_process 路径，且不等待 exec_lock。
+        interrupt = self._detect_interrupt_command(command)
+        if interrupt:
+            logger.warning(f"execute: 将 interrupt 命令 '{interrupt}' 重定向到 stop_process 安全路径")
+            return self._cmd_stop_process(package_name=package_name, adb_serial=adb_serial)
+
+        # 拦截会长时间持锁的 continue/step/run 类命令 → 引导到专用异步工具
+        blocking = self._detect_blocking_command(command)
+        if blocking:
+            logger.warning(f"execute: 拒绝长阻塞命令 '{blocking}' (原始: '{command}')")
+            return self._BLOCKING_HELP_HINT.format(matched=blocking)
+
         # 超时保护：如果另一个命令正在执行（如 step），不无限期等待
         if not self.exec_lock.acquire(timeout=10):
             logger.warning(f"execute: 无法获取 exec_lock (10s 超时)，命令 '{command}' 被拒绝")
-            return "[错误: 另一个命令正在执行中，请稍后重试。如需中断，请使用 lldb_stop]"
+            return "[错误: 另一个命令正在执行中，请稍后重试。如需中断，请使用 lldb_stop。lldb_stop / lldb_status 不依赖 exec_lock，可随时抢占。]"
         try:
             # 关键修复: 仅在进程非运行态时切换同步模式
             # 进程运行中切换 SetAsync 会导致 LLDB 内部事件处理状态不一致（state desync）
@@ -356,11 +820,28 @@ class LLDBBridge:
             self.exec_lock.release()
     
     def _cmd_execute_batch(self, commands: list, labels: list = None) -> str:
-        """批量执行多个 lldb 命令（一次锁获取，一次连接 + 超时保护）"""
+        """批量执行多个 lldb 命令（一次锁获取，一次连接 + 超时保护 + 长阻塞命令拦截）"""
         logger.info(f"execute_batch: 批量执行 {len(commands)} 个命令")
+
+        # 拦截批中任何一条长阻塞命令（一旦含有就整包拒绝，避免部分执行后被卡住）
+        for idx, command in enumerate(commands):
+            interrupt = self._detect_interrupt_command(command)
+            if interrupt:
+                logger.warning(f"execute_batch: 第 {idx} 条命令 '{command}' 是 interrupt '{interrupt}'，整批拒绝")
+                return (
+                    f"[错误: lldb_execute_batch 拒绝执行中断命令 '{interrupt}'。\n"
+                    "原因: process interrupt/halt 需要先做 stale target preflight，批量命令无法携带 package_name/adb_serial 诊断参数。\n"
+                    "请改用 lldb_stop(package_name=\"...\")，或 lldb_execute(command=\"process interrupt\", package_name=\"...\")。]"
+                )
+
+            blocking = self._detect_blocking_command(command)
+            if blocking:
+                logger.warning(f"execute_batch: 第 {idx} 条命令 '{command}' 是长阻塞 '{blocking}'，整批拒绝")
+                return self._BLOCKING_HELP_HINT.format(matched=blocking)
+
         if not self.exec_lock.acquire(timeout=10):
             logger.warning(f"execute_batch: 无法获取 exec_lock (10s 超时)，批量命令被拒绝")
-            return "[错误: 另一个命令正在执行中，请稍后重试。如需中断，请使用 lldb_stop]"
+            return "[错误: 另一个命令正在执行中，请稍后重试。如需中断，请使用 lldb_stop。lldb_stop / lldb_status 不依赖 exec_lock，可随时抢占。]"
         try:
             should_force_sync = not self._process_continued
             orig_async = self.debugger.GetAsync()
@@ -435,26 +916,48 @@ class LLDBBridge:
         return info
             
     def _cmd_continue_async(self) -> Dict[str, Any]:
-        """继续执行（异步，立即返回不阻塞）"""
+        """
+        继续执行（异步，立即返回不阻塞）
+
+        判定逻辑（按优先级）：
+        1. cmd_result.Succeeded()==False → 命令本身失败 (success=False, did_not_resume=True)
+        2. state_after != stopped → 进程已真正 resume (success=True, resumed=True, stopped_immediately=False)
+        3. state_after == stopped 且 LLDB 输出含 "resuming" → resume 后立即停
+           (success=True, resumed=True, stopped_immediately=True)
+           典型场景：watchpoint/breakpoint/trace/signal 在前置位置立刻命中（如 VMP 单步 trace、auto-continue 链）
+        4. state_after == stopped 且 LLDB 输出无 "resuming" → 真正未发出 resume
+           (success=False, did_not_resume=True)
+           典型场景：auto-continue 回调失败、内部状态错误等
+        """
         with self.exec_lock:
             target = self.debugger.GetSelectedTarget()
             if not target.IsValid():
                 logger.error("continue_async: 没有调试目标")
-                return {'success': False, 'error': '没有调试目标'}
+                return {'success': False, 'resumed': False, 'error': '没有调试目标'}
             process = target.GetProcess()
             if not process.IsValid():
                 logger.error("continue_async: 进程无效")
-                return {'success': False, 'error': '进程无效'}
-            
-            # 记录当前状态
+                return {'success': False, 'resumed': False, 'error': '进程无效'}
+
+            state_map = self._build_state_map()
+            reason_map = self._build_stop_reason_map()
+            STATE_STOPPED = getattr(lldb, 'eStateStopped', 6)
+
+            # 记录 continue 前的 PC / 状态（用于 same_pc 判断）
+            pc_before = None
+            thread_before = process.GetSelectedThread()
+            if thread_before and thread_before.IsValid():
+                frame_before = thread_before.GetSelectedFrame()
+                if frame_before and frame_before.IsValid():
+                    pc_before = frame_before.GetPC()
             state_before = process.GetState()
-            logger.info(f"continue_async: 执行前状态={state_before}, pid={process.GetProcessID()}")
-            
+            logger.info(f"continue_async: 执行前 state={state_before}, pid={process.GetProcessID()}, pc_before={('0x%x' % pc_before) if pc_before is not None else None}")
+
             # 关键：必须设为异步模式，否则 HandleCommand("continue") 会阻塞等待进程停止
             orig_async = self.debugger.GetAsync()
             logger.info(f"continue_async: orig_async={orig_async}, 设置为 True")
             self.debugger.SetAsync(True)
-            
+
             try:
                 # 关键修复: 使用 HandleCommand 而非 process.Continue()
                 # 通过命令解释器执行 continue 确保:
@@ -462,37 +965,123 @@ class LLDBBridge:
                 # 2. LLDB 内部事件处理链完整（包括 auto-continue 逻辑）
                 cmd_result = lldb.SBCommandReturnObject()
                 self.debugger.GetCommandInterpreter().HandleCommand('process continue', cmd_result)
-                
+
+                # 收集 LLDB 命令的原始输出（同时含 stdout 和 stderr 通道）
+                raw_output_parts = []
+                if cmd_result.GetOutput():
+                    raw_output_parts.append(cmd_result.GetOutput())
+                if cmd_result.GetError():
+                    raw_output_parts.append(cmd_result.GetError())
+                raw_output = ''.join(raw_output_parts).strip()
+                # "Process N resuming" 是 LLDB 在成功发出 resume 时打印的关键凭证
+                output_indicates_resumed = ('resuming' in raw_output.lower())
+
                 state_after = process.GetState()
-                state_map = self._build_state_map()
                 state_str = state_map.get(state_after, str(state_after))
-                logger.info(f"continue_async: HandleCommand('process continue') succeeded={cmd_result.Succeeded()}, 状态={state_after}({state_str})")
-                
-                if not cmd_result.Succeeded():
+                cmd_succeeded = cmd_result.Succeeded()
+                logger.info(
+                    f"continue_async: HandleCommand 完成 succeeded={cmd_succeeded}, "
+                    f"state_after={state_after}({state_str}), "
+                    f"output_indicates_resumed={output_indicates_resumed}, raw_output={raw_output!r}"
+                )
+
+                # 分支1: 命令本身失败
+                if not cmd_succeeded:
                     error_msg = cmd_result.GetError() or '继续执行失败'
-                    logger.error(f"continue_async: 失败: {error_msg}")
-                    return {'success': False, 'error': error_msg}
-                
-                # 关键校验: HandleCommand 返回成功不代表进程真的 resume 了
-                # LLDB 有时 "process continue" 返回 Succeeded 但进程实际仍处于 stopped（如 auto-continue 回调失败）
-                if state_after == getattr(lldb, 'eStateStopped', 6):
-                    logger.warning(f"continue_async: HandleCommand 成功但进程仍为 stopped，可能未真正 resume")
+                    logger.error(f"continue_async: 命令失败: {error_msg}")
                     self._process_continued = False
-                    # 尝试获取停止原因，帮助调用方诊断
-                    thread = process.GetSelectedThread()
-                    stop_desc = thread.GetStopDescription(256) if thread and thread.IsValid() else ""
                     return {
-                        'success': False, 'did_not_resume': True,
-                        'error': '进程未恢复运行，仍处于 stopped 状态',
-                        'state': state_str, 'stop_description': stop_desc
+                        'success': False,
+                        'resumed': False,
+                        'did_not_resume': True,
+                        'error': error_msg,
+                        'raw_output': raw_output,
+                        'state': state_str,
                     }
-                
-                # 进程确实进入了 running/stepping 状态
-                self._process_continued = True
-                return {'success': True, 'message': '进程已继续执行', 'state': state_str}
+
+                # 分支2: 进程已真正 running/stepping → 干净 resume
+                if state_after != STATE_STOPPED:
+                    self._process_continued = True
+                    return {
+                        'success': True,
+                        'resumed': True,
+                        'stopped_immediately': False,
+                        'message': '进程已继续执行',
+                        'state': state_str,
+                        'pc_before': f"0x{pc_before:x}" if pc_before is not None else None,
+                        'raw_output': raw_output,
+                    }
+
+                # 分支3 / 4: state_after == stopped，需要凭借 raw_output 区分
+                # 不论哪种情况，进程当前都是停止的，需恢复同步模式 + 标记非运行态
+                self._process_continued = False
+                self.debugger.SetAsync(False)
+
+                # 收集停止现场（reason / pc_after / frame_info / stop_description）
+                thread_after = process.GetSelectedThread()
+                pc_after = None
+                stop_desc = ""
+                reason_label = None
+                frame_info = ""
+                thread_id = None
+                if thread_after and thread_after.IsValid():
+                    thread_id = thread_after.GetThreadID()
+                    stop_desc = thread_after.GetStopDescription(1024) or ""
+                    reason_value = thread_after.GetStopReason()
+                    reason_label = reason_map.get(reason_value, f"unknown_{reason_value}")
+                    frame_after = thread_after.GetSelectedFrame()
+                    if frame_after and frame_after.IsValid():
+                        pc_after = frame_after.GetPC()
+                        func = frame_after.GetFunctionName() or "unknown"
+                        module = frame_after.GetModule()
+                        mod_name = module.GetFileSpec().GetFilename() if module.IsValid() else "unknown"
+                        frame_info = f"pc=0x{pc_after:x}, func={func}, module={mod_name}"
+
+                same_pc = None
+                if pc_before is not None and pc_after is not None:
+                    same_pc = (pc_before == pc_after)
+
+                common_payload = {
+                    'state': state_str,
+                    'reason': reason_label,
+                    'stop_description': stop_desc,
+                    'thread_id': thread_id,
+                    'pc_before': f"0x{pc_before:x}" if pc_before is not None else None,
+                    'pc_after': f"0x{pc_after:x}" if pc_after is not None else None,
+                    'same_pc': same_pc,
+                    'frame_info': frame_info,
+                    'raw_output': raw_output,
+                }
+
+                if output_indicates_resumed:
+                    # 分支3: resume 已发出，但进程瞬间又因前置停止条件命中（trace/wp/bp/signal）
+                    logger.info(
+                        f"continue_async: resume 后立即停止 (stopped_immediately=True), "
+                        f"reason={reason_label}, same_pc={same_pc}"
+                    )
+                    return {
+                        'success': True,
+                        'resumed': True,
+                        'stopped_immediately': True,
+                        'message': 'continue 已发出且进程瞬间恢复，但立即在前置停止条件命中（trace/watchpoint/breakpoint/signal 等）',
+                        **common_payload,
+                    }
+
+                # 分支4: 真未 resume（如 auto-continue 回调失败）
+                logger.warning(
+                    f"continue_async: 命令成功但 LLDB 未输出 resuming，判定为真正未 resume; "
+                    f"reason={reason_label}, raw_output={raw_output!r}"
+                )
+                return {
+                    'success': False,
+                    'resumed': False,
+                    'did_not_resume': True,
+                    'error': '进程未恢复运行，仍处于 stopped 状态（LLDB 命令成功但无 resuming 输出）',
+                    **common_payload,
+                }
             except Exception as e:
                 logger.error(f"continue_async: 异常: {e}", exc_info=True)
-                return {'success': False, 'error': str(e)}
+                return {'success': False, 'resumed': False, 'error': str(e)}
     
     def _cmd_step_async(self, action: str) -> Dict[str, Any]:
         """
@@ -548,7 +1137,7 @@ class LLDBBridge:
                 logger.error(f"step_async: 异常: {e}", exc_info=True)
                 return {'success': False, 'error': str(e)}
             
-    def _cmd_stop_process(self) -> Dict[str, Any]:
+    def _cmd_stop_process(self, package_name: str = "", adb_serial: str = "") -> Dict[str, Any]:
         """
         暂停进程（不持有 exec_lock，允许中断正在执行的命令）
         
@@ -568,7 +1157,39 @@ class LLDBBridge:
             return {'success': False, 'error': '进程无效'}
         
         state_before = process.GetState()
-        logger.info(f"stop_process: 执行前状态={state_before}")
+        state_map = self._build_state_map()
+        state_before_str = state_map.get(state_before, str(state_before))
+        logger.info(
+            f"stop_process: 执行前状态={state_before}({state_before_str}), "
+            f"pid={process.GetProcessID()}, package_name={package_name!r}, adb_serial={adb_serial!r}"
+        )
+
+        # halt/interrupt 前先校验 target PID/liveness，避免对 stale target 触发长时间 Halt timeout。
+        preflight_failure = self._preflight_interrupt(
+            target,
+            process,
+            package_name=package_name,
+            adb_serial=adb_serial,
+        )
+        if preflight_failure:
+            return preflight_failure
+
+        if state_before == getattr(lldb, 'eStateStopped', 6):
+            self._process_continued = False
+            self.debugger.SetAsync(False)
+            diagnostics = self._collect_process_diagnostics(
+                target,
+                process,
+                package_name=package_name,
+                adb_serial=adb_serial,
+                include_adb=bool(package_name),
+            )
+            return {
+                'success': True,
+                'message': '进程已处于 stopped 状态',
+                'already_stopped': True,
+                'diagnostics': diagnostics,
+            }
         
         error = process.Stop()
         state_after = process.GetState()
@@ -581,20 +1202,33 @@ class LLDBBridge:
             return {'success': True, 'message': '进程已暂停'}
         
         # halt 失败（如 "Halt timed out"），附带进程诊断帮助判断原因
-        state_map = self._build_state_map()
-        diag = {
-            'pid': process.GetProcessID(),
-            'state': state_map.get(state_after, str(state_after)),
-            'num_threads': process.GetNumThreads(),
-        }
-        # 检查 target 是否还活着
-        target_alive = target.IsValid()
-        diag['target_alive'] = target_alive
+        diag = self._collect_process_diagnostics(
+            target,
+            process,
+            package_name=package_name,
+            adb_serial=adb_serial,
+            include_adb=True,
+        )
+        # Stop() 期间目标可能刚好重启，失败后再做一次 stale/process_ended 归因。
+        postflight_failure = self._preflight_interrupt(
+            target,
+            process,
+            package_name=package_name,
+            adb_serial=adb_serial,
+        )
+        if postflight_failure:
+            postflight_failure['interrupt_error'] = str(error)
+            return postflight_failure
         
         logger.warning(f"stop_process: Stop() 失败: {error}, 诊断: {diag}")
         return {
             'success': False,
+            'reason': 'halt_failed',
             'error': str(error),
+            'lldb_pid': diag.get('lldb_pid'),
+            'adb_pid': diag.get('adb_pid'),
+            'adb_current_pid': diag.get('adb_current_pid'),
+            'state': diag.get('state'),
             'diagnostics': diag,
             'hint': 'Halt timed out 可能原因: stale process (已退出但状态未刷新)、remote debugserver 卡死、调试服务状态不一致',
         }

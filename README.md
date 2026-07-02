@@ -1,6 +1,6 @@
 # lldbAiHelper_MCP
 
-* Update: `20260529`
+* Update: `20260702`
 
 ## Intro
 
@@ -29,7 +29,8 @@ LLDB `MCP` (Model Context Protocol) Bridge + Server, enabling AI assistants (Qod
 - **Bridge Disconnect Diagnostics**: When Bridge connection fails, MCP Server automatically collects port file status and recent Bridge log tail for diagnosis; Bridge records process state on exit
 - **Structured Stop Reason**: `wait_for_stop` returns stable string reason (never raw enum numbers), always includes `thread_id`, `pc`, `process_state` as structured fields
 - **LLDB Version Safe**: All LLDB enum references use `getattr()` runtime lookup, no `AttributeError` crashes across different LLDB versions
-- **Halt Timeout Diagnostics**: `lldb_stop` returns process diagnostics (pid, state, thread count, target alive) when halt fails, helping diagnose stale process or debugserver issues
+- **Stale Target Guard**: `lldb_stop(package_name=...)` checks LLDB PID against `adb shell pidof` before interrupting Android targets, returning `stale_target` / `process_ended` instead of waiting for `Halt timed out`
+- **Halt Timeout Diagnostics**: `lldb_stop` returns process diagnostics (LLDB PID, optional ADB PID, state, thread count, target alive) when halt fails, helping diagnose stale process or debugserver issues
 - **Auto Confirm**: Bridge auto-sets `auto-confirm true` so AI-driven operations (e.g., `breakpoint delete`) won't block on user prompts
 - **Batch Operations**: Register read supports comma-separated batch (e.g., `"x0,x1,sp,pc"`); dedicated batch tools for memory read, breakpoint set/delete reduce MCP round-trips
 - **Full Toolset**: 21 MCP tools covering execution control, memory, registers, breakpoints, disassembly, flow control, ObjC analysis, and batch operations
@@ -155,11 +156,11 @@ Available commands inside LLDB after loading the Bridge:
 |------|-------------|
 | `lldb_connect()` | Test Bridge connectivity |
 | `lldb_status()` | Get debug status (process, thread, frame) as structured JSON |
-| `lldb_execute(command)` | Execute any LLDB command (universal tool) |
+| `lldb_execute(command, package_name, adb_serial)` | Execute any LLDB command; `package_name`/`adb_serial` are used when redirecting `process interrupt/halt` through stale-target-safe stop |
 | `lldb_memory_read(address, count, format)` | Read memory (hex/string/instruction/pointer/binary) |
 | `lldb_disassemble(target, count)` | Disassemble (current PC, function name, or address) |
 | `lldb_continue()` | Resume execution (async, returns immediately) |
-| `lldb_stop()` | Pause running process |
+| `lldb_stop(package_name, adb_serial)` | Pause running process; pass Android package name to pre-detect stale target PID before interrupt |
 | `lldb_wait_stop(timeout)` | Wait for stop event; distinguishes normal breakpoint hits vs condition expression errors |
 | `lldb_flow_control(action)` | Step control: next/step/finish/ni/si (async, non-blocking, preemptible by `lldb_stop`) |
 | `lldb_po(expression)` | Print ObjC object description |
@@ -209,6 +210,15 @@ Available commands inside LLDB after loading the Bridge:
 - Even if `step_async` or `continue_async` holds the lock, `lldb_stop` can concurrently call `process.Stop()`
 - `lldb_status` (`_cmd_get_status`) also does NOT acquire the lock — read-only LLDB SB API calls are thread-safe
 - `_cmd_execute` / `_cmd_execute_batch` use `exec_lock.acquire(timeout=10)` instead of `with self.exec_lock`, so they fail fast instead of blocking indefinitely when the lock is held
+
+### Stale Android Target Detection
+
+- Android apps may restart while LLDB still exposes the old remote PID as `running`; calling `process.Stop()` against that stale target can wait until `Halt timed out`
+- `lldb_stop(package_name="com.example.app")` checks `adb shell pidof <package>` before halt/interrupt
+- If ADB reports a different current PID, Bridge returns `reason: "stale_target"` with `lldb_pid`, `adb_current_pid`, `state`, and diagnostics; if ADB reports no PID, it returns `reason: "process_ended"`
+- `lldb_execute("process interrupt", package_name="com.example.app")` and `lldb_execute("process halt", package_name="com.example.app")` are redirected to the same safe stop path and can carry explicit ADB context
+- `lldb_execute_batch(...)` rejects `process interrupt/halt` entries; use `lldb_stop(...)` or single-command `lldb_execute(...)` for interrupts
+- If `package_name` is omitted, Bridge still checks LLDB liveness/process-ended states and, on Android targets, verifies whether the LLDB PID still exists via `adb shell ps`; current-package PID comparison is only possible when the package name is provided or inferred from LLDB metadata
 
 ### Continue Resume Validation
 

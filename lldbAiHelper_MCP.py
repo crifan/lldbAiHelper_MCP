@@ -188,13 +188,30 @@ def run_mcp_server():
     # ---- 核心：通用命令 ----
     
     @mcp.tool()
-    def lldb_execute(command: str) -> str:
+    def lldb_execute(command: str, package_name: str = "", adb_serial: str = "") -> str:
         """
         执行任意 lldb 命令（万能工具）
-        
+
+        ⚠ 禁用清单（Bridge 会拒绝并返回错误）：
+            下列 “长阻塞” 命令会让 LLDB 同步等待进程停止，
+            期间会一直持有 exec_lock，拖住后续所有 lldb_execute 调用。
+            请改走专用异步工具：
+              - continue / c / process continue / thread continue
+                  → lldb_continue + lldb_wait_stop
+              - step (s) / next (n) / nexti (ni) / stepi (si) / finish
+                  → lldb_flow_control(action=...) + lldb_wait_stop
+              - run (r) / process launch
+                  → 一般在 LLDB 控制台手动启动
+              - thread step-in/step-over/step-out/step-inst/step-inst-over
+                  → lldb_flow_control(action=...) + lldb_wait_stop
+            如果当前调用返回“另一个命令正在执行中”:
+              请调用 lldb_stop 中断（lldb_stop / lldb_status 不依赖 exec_lock，可抢占）。
+
         Args:
-            command: 任意 lldb 命令
-            
+            command: 任意 lldb 命令（需避开上述长阻塞命令）
+            package_name: 仅在 command 为 process interrupt/halt 时使用，用于 Android stale target PID 校验
+            adb_serial: 仅在 command 为 process interrupt/halt 时使用，多设备时指定 adb 设备
+
         Examples:
             lldb_execute("bt")
             lldb_execute("register read")
@@ -205,9 +222,14 @@ def run_mcp_server():
             lldb_execute("frame variable")
             lldb_execute("watchpoint set expression -w write -- 0x1234")
             lldb_execute("process connect connect://127.0.0.1:1234")
+            lldb_execute("process interrupt", package_name="com.example.app")
             lldb_execute("expression -l objc -O -- [NSClassFromString(@\"UIViewController\") _shortMethodDescription]")
         """
-        return call_bridge('execute', command=command)
+        bridge_args = {'command': command}
+        if package_name or adb_serial:
+            bridge_args['package_name'] = package_name
+            bridge_args['adb_serial'] = adb_serial
+        return call_bridge('execute', **bridge_args)
         
     # ---- 内存读取 ----
     
@@ -271,13 +293,47 @@ def run_mcp_server():
     
     @mcp.tool()
     def lldb_continue() -> str:
-        """继续执行程序（异步，立即返回。之后用 lldb_wait_stop 等待断点命中）"""
+        """
+        继续执行程序（异步，立即返回。之后用 lldb_wait_stop 等待断点命中）
+
+        Returns:
+            JSON 结构包含:
+            - success: bool - 是否应视为成功（只要 resume 已发出就是 true，哪怕瞬间又停了）
+            - resumed: bool - 进程是否已发出过 resume（以 LLDB 输出中的 "Process N resuming" 为凭证）
+            - stopped_immediately: bool - resume 后是否立即又被停住（如 trace/watchpoint/breakpoint/signal 命中）
+            - state: str - 进程当前状态 (running / stepping / stopped 等)
+            - raw_output: str - LLDB "process continue" 命令的原始输出（包含 stdout+stderr）
+            - pc_before: str | null - continue 前的 PC（0xXXXX 十六进制）
+
+            当 stopped_immediately=true 或 进程已然停住时额外包含:
+            - reason: str - 停止原因 (trace / watchpoint / breakpoint / signal / exception / step_complete 等)
+            - stop_description: str - LLDB 原始停止描述
+            - thread_id: int - 当前线程 ID
+            - pc_after: str | null - 停住后的 PC
+            - same_pc: bool | null - 停住后 PC 是否与 continue 前相同（VMP 单步 trace 场景常为 true）
+            - frame_info: str - 当前帧信息 (pc, func, module)
+
+            当仅返回失败时额外包含:
+            - did_not_resume: true - 仅在“真正未发出 resume”时设置（如命令本身失败、auto-continue 回调出错）
+              注意: resume 后被立即停住的场景不再被标记为 did_not_resume，而是 stopped_immediately。
+            - error: str - 错误描述
+        """
         return call_bridge('continue_async')
         
     @mcp.tool()
-    def lldb_stop() -> str:
-        """暂停正在运行的程序"""
-        return call_bridge('stop_process')
+    def lldb_stop(package_name: str = "", adb_serial: str = "") -> str:
+        """
+        暂停正在运行的程序。
+
+        Android 调试时建议传入 package_name，Bridge 会在 halt/interrupt 前用
+        adb pidof 校验 LLDB PID 是否仍是当前进程；若已重启，会直接返回
+        reason=stale_target / process_ended，避免长时间 Halt timed out。
+
+        Args:
+            package_name: Android 包名/进程名，如 "com.example.app"（可选）
+            adb_serial: adb 设备序列号，多设备时使用（可选）
+        """
+        return call_bridge('stop_process', package_name=package_name, adb_serial=adb_serial)
         
     @mcp.tool()
     def lldb_wait_stop(timeout: float = 60.0) -> str:
